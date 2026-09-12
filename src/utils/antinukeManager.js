@@ -1,6 +1,7 @@
 const { AuditLogEvent, PermissionsBitField } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
 const { sendLog } = require('./logger');
+const { withRetry } = require('./retry');
 
 const activity = new Map();
 const punishedRecently = new Map();
@@ -10,14 +11,33 @@ const punishedRecently = new Map();
 // op triggers its own fetchAuditLogs() call, which (a) tanks the speed of the operation and
 // (b) can trip the antinuke thresholds and get the admin who ran the command punished by their
 // own bot mid-operation.
-const suppressedGuilds = new Set();
+//
+// Stores guildId -> expiry timestamp instead of just membership. This is a safety net: if
+// whatever started the suppressed operation throws before it reaches its own cleanup code
+// (e.g. an unhandled error partway through a wipe), the guild used to stay suppressed forever —
+// anti-nuke silently stopped protecting channelDelete/ban/etc. for that server until the bot
+// process restarted, with no error shown anywhere. An expiry means a bug like that degrades to
+// "protection paused for a few minutes," not "protection silently disabled indefinitely."
+const suppressedGuilds = new Map();
+const DEFAULT_SUPPRESSION_MS = 10 * 60 * 1000; // 10 minutes — generous for even a huge server wipe
 
-function beginSuppressedOperation(guildId) {
-  suppressedGuilds.add(guildId);
+function beginSuppressedOperation(guildId, maxDurationMs = DEFAULT_SUPPRESSION_MS) {
+  suppressedGuilds.set(guildId, Date.now() + maxDurationMs);
 }
 
 function endSuppressedOperation(guildId) {
   suppressedGuilds.delete(guildId);
+}
+
+function isSuppressed(guildId) {
+  const expiresAt = suppressedGuilds.get(guildId);
+  if (expiresAt === undefined) return false;
+  if (Date.now() > expiresAt) {
+    // Expired safety net — clear it so we don't keep checking a stale entry.
+    suppressedGuilds.delete(guildId);
+    return false;
+  }
+  return true;
 }
 
 const DANGEROUS_PERMS = [
@@ -86,7 +106,7 @@ async function punish(guild, config, executorId, reason) {
     if (config.antinuke.punishment === 'strip_ban' || config.antinuke.punishment === 'strip_only') {
       const removable = member.roles.cache.filter(r => r.id !== guild.id && r.editable);
       if (removable.size) {
-        await member.roles.remove(removable, `AETHEROS Anti-Nuke: ${reason}`);
+        await withRetry(() => member.roles.remove(removable, `AETHEROS Anti-Nuke: ${reason}`));
         actionsTaken.push('roles stripped');
       }
     }
@@ -95,12 +115,12 @@ async function punish(guild, config, executorId, reason) {
   try {
     if (config.antinuke.punishment === 'strip_ban') {
       if (member.bannable) {
-        await member.ban({ reason: `AETHEROS Anti-Nuke: ${reason}` });
+        await withRetry(() => member.ban({ reason: `AETHEROS Anti-Nuke: ${reason}` }));
         actionsTaken.push('banned');
       }
     } else if (config.antinuke.punishment === 'strip_kick') {
       if (member.kickable) {
-        await member.kick(`AETHEROS Anti-Nuke: ${reason}`);
+        await withRetry(() => member.kick(`AETHEROS Anti-Nuke: ${reason}`));
         actionsTaken.push('kicked');
       }
     }
@@ -118,7 +138,7 @@ async function punish(guild, config, executorId, reason) {
 }
 
 async function guard(guild, actionKey, auditLogEvent, targetId, extraReason) {
-  if (suppressedGuilds.has(guild.id)) return;
+  if (isSuppressed(guild.id)) return;
   const config = getGuild(guild.id);
   if (!config.antinuke.enabled) return;
   const threshold = config.antinuke.thresholds[actionKey];
@@ -137,14 +157,14 @@ async function guard(guild, actionKey, auditLogEvent, targetId, extraReason) {
 }
 
 async function guardInstant(guild, executorId, reason) {
-  if (suppressedGuilds.has(guild.id)) return;
+  if (isSuppressed(guild.id)) return;
   const config = getGuild(guild.id);
   if (!config.antinuke.enabled) return;
   await punish(guild, config, executorId, reason);
 }
 
 async function guardMessage(guild, member, actionKey, reason) {
-  if (suppressedGuilds.has(guild.id)) return;
+  if (isSuppressed(guild.id)) return;
   const config = getGuild(guild.id);
   if (!config.antinuke.enabled) return;
   const threshold = config.antinuke.thresholds[actionKey];
@@ -165,5 +185,6 @@ module.exports = {
   isImmune,
   DANGEROUS_PERMS,
   beginSuppressedOperation,
-  endSuppressedOperation
+  endSuppressedOperation,
+  isSuppressed
 };
