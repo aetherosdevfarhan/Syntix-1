@@ -1,6 +1,7 @@
 const { Events, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
 const { guardMessage, beginSuppressedOperation, endSuppressedOperation } = require('../utils/antinukeManager');
+const { withRetry } = require('../utils/retry');
 const music = require('../utils/musicManager');
 const { matchAutoResponse, findAutoReactEmojis, normalize } = require('../utils/autoEngage');
 
@@ -137,12 +138,14 @@ module.exports = {
           `\`${prefix}hide [#channel]\` / \`${prefix}unhide [#channel]\` — hide/reveal a text channel\n` +
           `\`${prefix}role @user @role\` — toggle a role on a member\n` +
           `\`${prefix}mute @user <time>\` / \`${prefix}unmute @user\` — timeout or lift a timeout (e.g. \`10m\`, \`2h\`, \`1d\`)\n` +
-          `\`${prefix}nick @user <nickname>\` — set a member's nickname\n` +
-          `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n\n` +
+          `\`${prefix}nick @user <nickname>\` — set a member's nickname\n\n` +
           `**Anti-Nuke** (admin only)\n` +
           `\`${prefix}antinukeenable [#logchannel]\` — enable protection\n` +
           `\`${prefix}antinukedisable\` — disable protection\n` +
           `\`${prefix}wl add|remove|list [@user]\` — manage the anti-nuke whitelist\n\n` +
+          `**Bot owner only**\n` +
+          `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n` +
+          `\`${prefix}nuke\` — wipe the server (delete channels/roles, ban everyone)\n\n` +
           `**Music**\n` +
           `\`${prefix}play <song or URL>\` — play or queue a song\n` +
           `\`${prefix}skip\` · \`${prefix}stop\` · \`${prefix}pause\` · \`${prefix}resume\`\n` +
@@ -291,9 +294,12 @@ module.exports = {
 
     // ---- bulk channel creation (two-step conversation) ----
     if (cmd === 'createchannels' || cmd === 'makechannels') {
-      if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
-        return message.reply('❌ You need **Manage Channels** to do that.');
+      const ownerId = process.env.OWNER_ID?.trim();
+      if (!ownerId) {
+        return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
       }
+      if (message.author.id !== ownerId) return;
+
       const me = message.guild.members.me;
       if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
         return message.reply('❌ I need the **Manage Channels** permission to create channels.');
@@ -366,10 +372,10 @@ module.exports = {
       try {
         await runBatched(jobs, 15, async (name) => {
           try {
-            await message.guild.channels.create({
+            await withRetry(() => message.guild.channels.create({
               name,
               type: channelType
-            });
+            }));
             created++;
           } catch (err) {
             failed++;
