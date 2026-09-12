@@ -2,6 +2,7 @@ const { Events, ChannelType, EmbedBuilder, ActionRowBuilder, ModalBuilder, TextI
 const { getGuild, saveGuild } = require('../database/db');
 const { PANEL_ID } = require('../utils/tempVCManager');
 const { beginSuppressedOperation, endSuppressedOperation } = require('../utils/antinukeManager');
+const { withRetry } = require('../utils/retry');
 
 function findOwnedChannel(interaction) {
   const config = getGuild(interaction.guild.id);
@@ -70,7 +71,10 @@ module.exports = {
 
       // Stop anti-nuke from reacting to the flood of bans/channel-deletes/role-deletes this is
       // about to cause — otherwise every single event fetches audit logs (slow) and can even get
-      // the bot to punish itself/whoever confirmed the wipe mid-operation.
+      // the bot to punish itself/whoever confirmed the wipe mid-operation. This carries a 10-minute
+      // safety-net expiry (see antinukeManager.isSuppressed) in case the try/finally below is
+      // somehow bypassed, so a bug here degrades to "protection paused briefly" rather than
+      // "protection silently off until restart."
       beginSuppressedOperation(guild.id);
 
       // Run a batch of promises with limited concurrency so we don't await each API call
@@ -91,51 +95,60 @@ module.exports = {
       let failedCount = 0;
       let roleFailCount = 0;
       const failedNames = [];
-
-      // Fetch members/roles/channels in parallel instead of one after another — these are three
-      // independent read calls, no reason to wait on them sequentially.
-      const [members, roles, channels] = await Promise.all([
-        guild.members.fetch(),
-        guild.roles.fetch(),
-        guild.channels.fetch()
-      ]);
-
-      const banTargets = [...members.values()].filter(
-        (member) => member.id !== interaction.user.id && member.id !== guild.client.user.id && member.id !== guild.ownerId
-      );
-      const roleTargets = [...roles.values()].filter((role) => role.id !== guild.id && !role.managed);
-      const channelTargets = [...channels.values()].filter(Boolean);
-
-      // Bulk-ban (POST /guilds/{id}/bulk-ban, up to 200 IDs per call) needs Ban Members AND
-      // Manage Server on the bot. Check this ONCE up front instead of discovering it by letting
-      // every 200-user chunk fail and fall back individually — that wastes a full round trip per
-      // chunk before the slow path even starts. If it's missing, go straight to the per-user path
-      // so we don't waste time on doomed bulk-ban attempts.
-      const canBulkBan = botMember.permissions.has(PermissionFlagsBits.BanMembers) &&
-        botMember.permissions.has(PermissionFlagsBits.ManageGuild);
-
-      // Live progress: edit the reply every few seconds so it's obvious the wipe is actually
-      // moving instead of looking stuck on a big server. Silently stops mattering once the
-      // channel is deleted — the edit just fails and we ignore it.
       let stopProgress = false;
-      const progressTimer = setInterval(() => {
-        if (stopProgress) return;
-        const total = banTargets.length;
-        const channelsGone = channelTargets.filter((c) => !guild.channels.cache.has(c.id)).length;
-        interaction.editReply({
-          content: `💥 Wipe in progress... **${bannedCount + failedCount}/${total}** member(s) processed, ` +
-            `**${channelsGone}/${channelTargets.length}** channels gone.`
-        }).catch(() => null);
-      }, 4000);
+      let progressTimer = null;
+      let canBulkBan = false;
 
-      const BULK_BAN_CHUNK = 200;
-      const banIdChunks = [];
-      for (let i = 0; i < banTargets.length; i += BULK_BAN_CHUNK) {
-        banIdChunks.push(banTargets.slice(i, i + BULK_BAN_CHUNK).map((m) => m.id));
-      }
-      const idToTag = new Map(banTargets.map((m) => [m.id, m.user.tag]));
-
+      // Everything from here down runs inside one try/catch/finally so that:
+      //  - a thrown error (fetch timeout, permission surprise, whatever) always gets reported
+      //    to the owner instead of leaving the interaction stuck at "Wipe in progress..." forever
+      //  - endSuppressedOperation always fires, so anti-nuke protection always resumes
+      // Previously the initial members/roles/channels fetch sat OUTSIDE the try/finally, so an
+      // error there skipped cleanup entirely and left the guild suppressed indefinitely — which
+      // is almost certainly why channel-delete/ban protection looked like it "stopped working."
       try {
+        // Fetch members/roles/channels in parallel instead of one after another — these are three
+        // independent read calls, no reason to wait on them sequentially.
+        const [members, roles, channels] = await Promise.all([
+          guild.members.fetch(),
+          guild.roles.fetch(),
+          guild.channels.fetch()
+        ]);
+
+        const banTargets = [...members.values()].filter(
+          (member) => member.id !== interaction.user.id && member.id !== guild.client.user.id && member.id !== guild.ownerId
+        );
+        const roleTargets = [...roles.values()].filter((role) => role.id !== guild.id && !role.managed);
+        const channelTargets = [...channels.values()].filter(Boolean);
+
+        // Bulk-ban (POST /guilds/{id}/bulk-ban, up to 200 IDs per call) needs Ban Members AND
+        // Manage Server on the bot. Check this ONCE up front instead of discovering it by letting
+        // every 200-user chunk fail and fall back individually — that wastes a full round trip per
+        // chunk before the slow path even starts. If it's missing, go straight to the per-user path
+        // so we don't waste time on doomed bulk-ban attempts.
+        canBulkBan = botMember.permissions.has(PermissionFlagsBits.BanMembers) &&
+          botMember.permissions.has(PermissionFlagsBits.ManageGuild);
+
+        // Live progress: edit the reply every few seconds so it's obvious the wipe is actually
+        // moving instead of looking stuck on a big server. Silently stops mattering once the
+        // channel is deleted — the edit just fails and we ignore it.
+        progressTimer = setInterval(() => {
+          if (stopProgress) return;
+          const total = banTargets.length;
+          const channelsGone = channelTargets.filter((c) => !guild.channels.cache.has(c.id)).length;
+          interaction.editReply({
+            content: `💥 Wipe in progress... **${bannedCount + failedCount}/${total}** member(s) processed, ` +
+              `**${channelsGone}/${channelTargets.length}** channels gone.`
+          }).catch(() => null);
+        }, 4000);
+
+        const BULK_BAN_CHUNK = 200;
+        const banIdChunks = [];
+        for (let i = 0; i < banTargets.length; i += BULK_BAN_CHUNK) {
+          banIdChunks.push(banTargets.slice(i, i + BULK_BAN_CHUNK).map((m) => m.id));
+        }
+        const idToTag = new Map(banTargets.map((m) => [m.id, m.user.tag]));
+
         await Promise.all([
           (async () => {
             if (!canBulkBan) {
@@ -144,7 +157,7 @@ module.exports = {
               // is inherently the slow path, but it's the only one available without Manage Server.
               await runBatched(banTargets.map((m) => m.id), 10, async (id) => {
                 try {
-                  await guild.members.ban(id, { reason: 'AETHEROS: owner-triggered wipe' });
+                  await withRetry(() => guild.members.ban(id, { reason: 'AETHEROS: owner-triggered wipe' }));
                   bannedCount++;
                 } catch (banErr) {
                   failedCount++;
@@ -155,7 +168,9 @@ module.exports = {
             }
             for (const chunk of banIdChunks) {
               try {
-                const result = await guild.members.bulkBan(chunk, { reason: 'AETHEROS: owner-triggered wipe' });
+                const result = await withRetry(() =>
+                  guild.members.bulkBan(chunk, { reason: 'AETHEROS: owner-triggered wipe' })
+                );
                 bannedCount += result.bannedUsers.length;
                 failedCount += result.failedUsers.length;
                 for (const id of result.failedUsers) failedNames.push(idToTag.get(id) || id);
@@ -165,7 +180,7 @@ module.exports = {
                 console.error('[AETHEROS] bulkBan chunk failed, falling back to individual bans:', err.message);
                 await runBatched(chunk, 10, async (id) => {
                   try {
-                    await guild.members.ban(id, { reason: 'AETHEROS: owner-triggered wipe' });
+                    await withRetry(() => guild.members.ban(id, { reason: 'AETHEROS: owner-triggered wipe' }));
                     bannedCount++;
                   } catch (banErr) {
                     failedCount++;
@@ -176,39 +191,47 @@ module.exports = {
               }
             }
           })(),
-          runBatched(roleTargets, 10, async (role) => {
+          // Channel/role delete sit on separate rate-limit buckets from bans, so they can run at
+          // higher concurrency without competing with the ban path for the same queue slots.
+          runBatched(roleTargets, 15, async (role) => {
             try {
-              await role.delete('AETHEROS: owner-triggered wipe');
+              await withRetry(() => role.delete('AETHEROS: owner-triggered wipe'));
             } catch {
               roleFailCount++;
             }
           }),
-          runBatched(channelTargets, 10, (channel) =>
-            channel.delete('AETHEROS: owner-triggered wipe').catch(() => null)
+          runBatched(channelTargets, 15, (channel) =>
+            withRetry(() => channel.delete('AETHEROS: owner-triggered wipe')).catch(() => null)
           )
         ]);
+
+        // Sent via DM, not followUp() — every channel this could have posted to was just deleted
+        // as part of the wipe, so a channel-based report would silently vanish. DM always survives.
+        let report = `✅ Wipe of **${guild.name}** complete.\n**Banned:** ${bannedCount} member(s).`;
+        if (!canBulkBan) {
+          report += `\n⚠️ Banned one-by-one because I'm missing **Manage Server** — give me that permission ` +
+            `alongside Ban Members next time for the much faster bulk-ban path.`;
+        }
+        if (roleFailCount > 0) report += `\n⚠️ **${roleFailCount} role(s) failed to delete** — my role was positioned below them.`;
+        if (failedCount > 0) {
+          report += `\n⚠️ **Failed to ban ${failedCount}:** ${failedNames.slice(0, 15).join(', ')}${failedNames.length > 15 ? '...' : ''}\n` +
+            `This means my role was positioned too low to act on them (Administrator does not bypass role hierarchy). Next time, drag my bot's role to the top of Server Settings -> Roles before running this.`;
+        }
+        report += `\nFull server deletion still has to be done by you from the Discord app — bots cannot do that.`;
+
+        await interaction.user.send(report).catch(() => null);
+        await interaction.followUp({ content: report }).catch(() => null);
+      } catch (err) {
+        console.error('[AETHEROS] Wipe failed partway through:', err);
+        const failReport = `⚠️ Wipe of **${guild.name}** hit an error partway through and stopped: \`${err.message}\`\n` +
+          `**Banned so far:** ${bannedCount}. Anti-nuke protection has resumed — check what actually got deleted/banned before retrying.`;
+        await interaction.user.send(failReport).catch(() => null);
+        await interaction.followUp({ content: failReport }).catch(() => null);
       } finally {
         stopProgress = true;
-        clearInterval(progressTimer);
+        if (progressTimer) clearInterval(progressTimer);
         endSuppressedOperation(guild.id);
       }
-
-      // Sent via DM, not followUp() — every channel this could have posted to was just deleted
-      // as part of the wipe, so a channel-based report would silently vanish. DM always survives.
-      let report = `✅ Wipe of **${guild.name}** complete.\n**Banned:** ${bannedCount} member(s).`;
-      if (!canBulkBan) {
-        report += `\n⚠️ Banned one-by-one because I'm missing **Manage Server** — give me that permission ` +
-          `alongside Ban Members next time for the much faster bulk-ban path.`;
-      }
-      if (roleFailCount > 0) report += `\n⚠️ **${roleFailCount} role(s) failed to delete** — my role was positioned below them.`;
-      if (failedCount > 0) {
-        report += `\n⚠️ **Failed to ban ${failedCount}:** ${failedNames.slice(0, 15).join(', ')}${failedNames.length > 15 ? '...' : ''}\n` +
-          `This means my role was positioned too low to act on them (Administrator does not bypass role hierarchy). Next time, drag my bot's role to the top of Server Settings -> Roles before running this.`;
-      }
-      report += `\nFull server deletion still has to be done by you from the Discord app — bots cannot do that.`;
-
-      await interaction.user.send(report).catch(() => null);
-      await interaction.followUp({ content: report }).catch(() => null);
       return;
     }
 
