@@ -2,6 +2,7 @@ const { Events, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuild
 const { getGuild, saveGuild } = require('../database/db');
 const { guardMessage, beginSuppressedOperation, endSuppressedOperation } = require('../utils/antinukeManager');
 const { withRetry } = require('../utils/retry');
+const { markPending, consume } = require('../utils/pendingConfirms');
 const music = require('../utils/musicManager');
 const { matchAutoResponse, findAutoReactEmojis, normalize } = require('../utils/autoEngage');
 
@@ -672,13 +673,29 @@ module.exports = {
         .setTitle('⚠️ Confirm server wipe')
         .setColor(0xED4245)
         .setDescription(
-          `This will **delete every channel and role**, and **ban every member** except you.\n` +
+          `This will delete **${message.guild.channels.cache.size} channel(s)**, ` +
+          `**${message.guild.roles.cache.filter(r => r.id !== message.guild.id && !r.managed).size} role(s)**, ` +
+          `and ban roughly **${message.guild.memberCount - 1} member(s)** (everyone but you).\n` +
           `This cannot be undone. Confirm within 15 seconds.${hierarchyWarning}${permWarning}`
         );
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`aeth_nuke_confirm_${message.author.id}`).setLabel('Confirm Wipe').setStyle(ButtonStyle.Danger)
       );
-      return message.reply({ embeds: [embed], components: [row] });
+      const sentMsg = await message.reply({ embeds: [embed], components: [row] });
+
+      // The embed says "confirm within 15 seconds" — actually enforce that instead of leaving
+      // the button clickable forever. If nobody's pressed it by then, disable it and swap the
+      // label so it's visually obvious it's dead, rather than silently still being live weeks later.
+      markPending(sentMsg.id);
+      setTimeout(async () => {
+        if (!consume(sentMsg.id)) return; // already confirmed (or already expired) — nothing to do
+        const expiredRow = new ActionRowBuilder().addComponents(
+          ButtonBuilder.from(row.components[0]).setDisabled(true).setLabel('Expired').setStyle(ButtonStyle.Secondary)
+        );
+        await sentMsg.edit({ components: [expiredRow] }).catch(() => null);
+      }, 15000);
+
+      return;
     }
 
     if (cmd === 'whitelist' || cmd === 'wl') {
