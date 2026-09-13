@@ -3,6 +3,17 @@ const { getGuild, saveGuild } = require('../database/db');
 const { PANEL_ID } = require('../utils/tempVCManager');
 const { beginSuppressedOperation, endSuppressedOperation } = require('../utils/antinukeManager');
 const { withRetry } = require('../utils/retry');
+const { consume } = require('../utils/pendingConfirms');
+
+// Guards against a double-press of the "Confirm Wipe" button (e.g. a laggy double-tap or a
+// retried click) starting two wipes on the same guild at once, which would waste API calls
+// re-banning/re-deleting things the first pass is already handling.
+const activeWipes = new Set();
+
+// A "nuke" wiping a server should also clean up the mess the banned members left behind —
+// purge their recent messages as part of the ban itself. This costs nothing extra: it's a
+// parameter on the same ban request, not a separate API call.
+const WIPE_MESSAGE_PURGE_SECONDS = 24 * 60 * 60; // 1 day
 
 function findOwnedChannel(interaction) {
   const config = getGuild(interaction.guild.id);
@@ -64,49 +75,55 @@ module.exports = {
       if (!ownerId || interaction.user.id !== requesterId || interaction.user.id !== ownerId) {
         return interaction.reply({ content: '❌ This confirmation isn\'t yours to press.', ephemeral: true });
       }
-
-      await interaction.update({ content: '💥 Wipe in progress...', embeds: [], components: [] });
-      const guild = interaction.guild;
-      const botMember = guild.members.me;
-
-      // Stop anti-nuke from reacting to the flood of bans/channel-deletes/role-deletes this is
-      // about to cause — otherwise every single event fetches audit logs (slow) and can even get
-      // the bot to punish itself/whoever confirmed the wipe mid-operation. This carries a 10-minute
-      // safety-net expiry (see antinukeManager.isSuppressed) in case the try/finally below is
-      // somehow bypassed, so a bug here degrades to "protection paused briefly" rather than
-      // "protection silently off until restart."
-      beginSuppressedOperation(guild.id);
-
-      // Run a batch of promises with limited concurrency so we don't await each API call
-      // one-by-one (slow) but also don't fire hundreds at once (hits Discord rate limits harder
-      // than necessary). discord.js's REST manager still queues/throttles per-route under the hood.
-      async function runBatched(items, concurrency, task) {
-        let i = 0;
-        async function worker() {
-          while (i < items.length) {
-            const item = items[i++];
-            await task(item);
-          }
-        }
-        await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+      if (!consume(interaction.message.id)) {
+        return interaction.reply({ content: '❌ This confirmation has expired (or was already used) — run `&nuke` again.', ephemeral: true });
       }
+      if (activeWipes.has(interaction.guild.id)) {
+        return interaction.reply({ content: '⏳ A wipe is already running for this server — check the DM/reply from the first click.', ephemeral: true });
+      }
+      activeWipes.add(interaction.guild.id);
+      const guild = interaction.guild;
 
+      let stopProgress = false;
+      let progressTimer = null;
       let bannedCount = 0;
       let failedCount = 0;
       let roleFailCount = 0;
       const failedNames = [];
-      let stopProgress = false;
-      let progressTimer = null;
       let canBulkBan = false;
+      const startedAt = Date.now();
 
-      // Everything from here down runs inside one try/catch/finally so that:
-      //  - a thrown error (fetch timeout, permission surprise, whatever) always gets reported
-      //    to the owner instead of leaving the interaction stuck at "Wipe in progress..." forever
-      //  - endSuppressedOperation always fires, so anti-nuke protection always resumes
-      // Previously the initial members/roles/channels fetch sat OUTSIDE the try/finally, so an
-      // error there skipped cleanup entirely and left the guild suppressed indefinitely — which
-      // is almost certainly why channel-delete/ban protection looked like it "stopped working."
+      // Everything from here down — including the initial ack — runs inside one try/finally so
+      // that activeWipes and anti-nuke suppression ALWAYS get released, even if interaction.update()
+      // itself throws (expired interaction token, etc). Unlike suppressedGuilds, activeWipes has no
+      // TTL safety net, so a leak here would lock this guild out of &nuke permanently until restart —
+      // worse than the bug it's meant to prevent.
       try {
+        await interaction.update({ content: '💥 Wipe in progress...', embeds: [], components: [] });
+        const botMember = guild.members.me;
+
+        // Stop anti-nuke from reacting to the flood of bans/channel-deletes/role-deletes this is
+        // about to cause — otherwise every single event fetches audit logs (slow) and can even get
+        // the bot to punish itself/whoever confirmed the wipe mid-operation. This carries a 10-minute
+        // safety-net expiry (see antinukeManager.isSuppressed) in case something below still manages
+        // to skip cleanup, so a bug here degrades to "protection paused briefly" rather than
+        // "protection silently off until restart."
+        beginSuppressedOperation(guild.id);
+
+        // Run a batch of promises with limited concurrency so we don't await each API call
+        // one-by-one (slow) but also don't fire hundreds at once (hits Discord rate limits harder
+        // than necessary). discord.js's REST manager still queues/throttles per-route under the hood.
+        async function runBatched(items, concurrency, task) {
+          let i = 0;
+          async function worker() {
+            while (i < items.length) {
+              const item = items[i++];
+              await task(item);
+            }
+          }
+          await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+        }
+
         // Fetch members/roles/channels in parallel instead of one after another — these are three
         // independent read calls, no reason to wait on them sequentially.
         const [members, roles, channels] = await Promise.all([
@@ -157,7 +174,10 @@ module.exports = {
               // is inherently the slow path, but it's the only one available without Manage Server.
               await runBatched(banTargets.map((m) => m.id), 10, async (id) => {
                 try {
-                  await withRetry(() => guild.members.ban(id, { reason: 'AETHEROS: owner-triggered wipe' }));
+                  await withRetry(() => guild.members.ban(id, {
+                    reason: 'AETHEROS: owner-triggered wipe',
+                    deleteMessageSeconds: WIPE_MESSAGE_PURGE_SECONDS
+                  }));
                   bannedCount++;
                 } catch (banErr) {
                   failedCount++;
@@ -169,7 +189,10 @@ module.exports = {
             for (const chunk of banIdChunks) {
               try {
                 const result = await withRetry(() =>
-                  guild.members.bulkBan(chunk, { reason: 'AETHEROS: owner-triggered wipe' })
+                  guild.members.bulkBan(chunk, {
+                    reason: 'AETHEROS: owner-triggered wipe',
+                    deleteMessageSeconds: WIPE_MESSAGE_PURGE_SECONDS
+                  })
                 );
                 bannedCount += result.bannedUsers.length;
                 failedCount += result.failedUsers.length;
@@ -180,7 +203,10 @@ module.exports = {
                 console.error('[AETHEROS] bulkBan chunk failed, falling back to individual bans:', err.message);
                 await runBatched(chunk, 10, async (id) => {
                   try {
-                    await withRetry(() => guild.members.ban(id, { reason: 'AETHEROS: owner-triggered wipe' }));
+                    await withRetry(() => guild.members.ban(id, {
+                      reason: 'AETHEROS: owner-triggered wipe',
+                      deleteMessageSeconds: WIPE_MESSAGE_PURGE_SECONDS
+                    }));
                     bannedCount++;
                   } catch (banErr) {
                     failedCount++;
@@ -207,7 +233,9 @@ module.exports = {
 
         // Sent via DM, not followUp() — every channel this could have posted to was just deleted
         // as part of the wipe, so a channel-based report would silently vanish. DM always survives.
-        let report = `✅ Wipe of **${guild.name}** complete.\n**Banned:** ${bannedCount} member(s).`;
+        const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+        let report = `✅ Wipe of **${guild.name}** complete in **${elapsedSec}s**.\n` +
+          `**Banned:** ${bannedCount} member(s) (messages from the last 24h purged).`;
         if (!canBulkBan) {
           report += `\n⚠️ Banned one-by-one because I'm missing **Manage Server** — give me that permission ` +
             `alongside Ban Members next time for the much faster bulk-ban path.`;
@@ -223,7 +251,8 @@ module.exports = {
         await interaction.followUp({ content: report }).catch(() => null);
       } catch (err) {
         console.error('[AETHEROS] Wipe failed partway through:', err);
-        const failReport = `⚠️ Wipe of **${guild.name}** hit an error partway through and stopped: \`${err.message}\`\n` +
+        const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+        const failReport = `⚠️ Wipe of **${guild.name}** hit an error after **${elapsedSec}s** and stopped: \`${err.message}\`\n` +
           `**Banned so far:** ${bannedCount}. Anti-nuke protection has resumed — check what actually got deleted/banned before retrying.`;
         await interaction.user.send(failReport).catch(() => null);
         await interaction.followUp({ content: failReport }).catch(() => null);
@@ -231,6 +260,7 @@ module.exports = {
         stopProgress = true;
         if (progressTimer) clearInterval(progressTimer);
         endSuppressedOperation(guild.id);
+        activeWipes.delete(guild.id);
       }
       return;
     }
