@@ -20,12 +20,12 @@ loadCommands(client);
 loadEvents(client);
 
 process.on('unhandledRejection', (err) => {
-  console.error('[AETHEROS] Unhandled promise rejection:', err);
+  console.error('[SYNTIX] Unhandled promise rejection:', err);
 });
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
-  console.error('[AETHEROS] DISCORD_TOKEN is missing from your .env file. The bot cannot log in without it.');
+  console.error('[SYNTIX] DISCORD_TOKEN is missing from your .env file. The bot cannot log in without it.');
   process.exit(1);
 }
 // NOTE: never log the token itself (even partially) — most hosts (Railway/Render/etc.)
@@ -38,5 +38,5 @@ client.login(token).catch((err) => {
 const http = require('node:http');
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => res.end('SYNTIX is running')).listen(PORT, () => {
-  console.log(`[AETHEROS] Dummy web server listening on port ${PORT} (for host health checks)`);
+  console.log(`[SYNTIX] Dummy web server listening on port ${PORT} (for host health checks)`);
 });
