@@ -12,16 +12,16 @@ function loadCommands(client) {
     try {
       command = require(path.join(commandsDir, file));
     } catch (err) {
-      console.error(`[AETHEROS] Failed to load command "${file}" — skipping it:`, err);
+      console.error(`[SYNTIX] Failed to load command "${file}" — skipping it:`, err);
       continue;
     }
     if (command?.data?.name && typeof command.execute === 'function') {
       client.commands.set(command.data.name, command);
     } else {
-      console.warn(`[AETHEROS] Skipping invalid command file: ${file}`);
+      console.warn(`[SYNTIX] Skipping invalid command file: ${file}`);
     }
   }
-  console.log(`[AETHEROS] Loaded ${client.commands.size} command(s).`);
+  console.log(`[SYNTIX] Loaded ${client.commands.size} command(s).`);
 }
 
 module.exports = { loadCommands };
