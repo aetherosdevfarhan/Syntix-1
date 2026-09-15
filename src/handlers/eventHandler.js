@@ -11,11 +11,11 @@ function loadEvents(client) {
     try {
       event = require(path.join(eventsDir, file));
     } catch (err) {
-      console.error(`[AETHEROS] Failed to load event "${file}" — skipping it so the rest of the bot still boots:`, err);
+      console.error(`[SYNTIX] Failed to load event "${file}" — skipping it so the rest of the bot still boots:`, err);
       continue;
     }
     if (!event?.name || typeof event.execute !== 'function') {
-      console.warn(`[AETHEROS] Skipping invalid event file: ${file}`);
+      console.warn(`[SYNTIX] Skipping invalid event file: ${file}`);
       continue;
     }
     if (event.once) {
@@ -25,7 +25,7 @@ function loadEvents(client) {
     }
     loaded++;
   }
-  console.log(`[AETHEROS] Loaded ${loaded} event(s).`);
+  console.log(`[SYNTIX] Loaded ${loaded} event(s).`);
 }
 
 module.exports = { loadEvents };
