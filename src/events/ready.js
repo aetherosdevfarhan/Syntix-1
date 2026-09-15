@@ -7,7 +7,7 @@ module.exports = {
   execute(client) {
     console.log(`[SYNTIX] Logged in as ${client.user.tag} — serving ${client.guilds.cache.size} server(s).`);
     client.user.setPresence({
-      activities: [{ name: 'A Powerful Multipurpose bot,with antinuke,vc managing and music💙', type: ActivityType. }],
+      activities: [{ name: 'A Powerful Multipurpose bot,with antinuke,vc managing and music💙', type: ActivityType.Playing }],
       status: 'online'
     });
   }
