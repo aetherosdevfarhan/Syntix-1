@@ -1,7 +1,7 @@
 {
   "name": "syntix",
   "version": "1.0.0",
-  "description": "MADE FOR AETHEROS BY FARHAN",
+  "description": "MADE FOR SYNTIX BY FARHAN",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
