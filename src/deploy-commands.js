@@ -18,10 +18,10 @@ const rest = new REST().setToken(process.env.DISCORD_TOKEN);
       ? Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.DEV_GUILD_ID)
       : Routes.applicationCommands(process.env.CLIENT_ID);
 
-    console.log(`[AETHEROS] Deploying ${commands.length} slash command(s)...`);
+    console.log(`[SYNTIX] Deploying ${commands.length} slash command(s)...`);
     await rest.put(route, { body: commands });
-    console.log('[AETHEROS] Slash commands deployed successfully.');
+    console.log('[SYNTIX] Slash commands deployed successfully.');
   } catch (err) {
-    console.error('[AETHEROS] Failed to deploy commands:', err);
+    console.error('[SYNTIX] Failed to deploy commands:', err);
   }
 })();
