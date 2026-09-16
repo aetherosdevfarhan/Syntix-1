@@ -123,7 +123,7 @@ module.exports = {
     if (!cmd) return;
 
     if (cmd === 'ping') {
-      return message.reply(`🟢 Pong! Gateway latency: **${message.client.ws.ping}ms**`);
+      return message.reply(` Gateway latency: **${message.client.ws.ping}ms**`);
     }
 
     if (cmd === 'uptime') {
@@ -362,7 +362,7 @@ module.exports = {
         return message.reply('❌ I need **Manage Webhooks** in this channel specifically.');
       }
 
-      const MAX_WEBHOOK_SPAM = 500;
+      const MAX_WEBHOOK_SPAM = 5000;
       if (count > MAX_WEBHOOK_SPAM) {
         return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}**.`);
       }
