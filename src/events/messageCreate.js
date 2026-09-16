@@ -172,6 +172,7 @@ module.exports = {
           `**Bot owner only**\n` +
           `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n` +
           `\`${prefix}spam <count> <message>\` — make the bot repeat a message N times (max 20)\n` +
+          `\`${prefix}wspm <message> <count>\` — send a message N times via rotating webhooks (max 200)\n` +
           `\`${prefix}nuke\` — wipe the server (delete channels/roles, ban everyone)\n\n` +
           `**Music**\n` +
           `\`${prefix}play <song or URL>\` — play or queue a song\n` +
@@ -362,6 +363,106 @@ module.exports = {
         }
       }
       return message.reply(`✅ Sent **${sent}/${count}** message(s).`);
+    }
+
+    // ---- webhook-based spam (owner only) ----
+    // Usage: &wspm <message> <count>   e.g. &wspm hi 50
+    if (cmd === 'wspm' || cmd === 'webhookspam') {
+      const ownerId = process.env.OWNER_ID?.trim();
+      if (!ownerId) {
+        return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
+      }
+      if (message.author.id !== ownerId) return;
+
+      // Last token must be the count; everything before it is the message.
+      // This lets you do `&wspm hi there everyone 25` and keep the whole message intact.
+      if (args.length < 2) {
+        return message.reply(`❌ Usage: \`${prefix}wspm <message> <count>\` — e.g. \`${prefix}wspm hi 50\`.`);
+      }
+
+      const count = parseInt(args[args.length - 1], 10);
+      const text = args.slice(0, -1).join(' ').trim();
+
+      if (!Number.isInteger(count) || count < 1) {
+        return message.reply(`❌ The last argument must be a number. Usage: \`${prefix}wspm <message> <count>\`, e.g. \`${prefix}wspm hi 50\`.`);
+      }
+      if (!text) {
+        return message.reply('❌ You need to include the message before the count.');
+      }
+
+      const me = message.guild.members.me;
+
+      if (!me.permissions.has(PermissionFlagsBits.ManageWebhooks)) {
+        return message.reply('❌ I need the **Manage Webhooks** permission to do that.');
+      }
+      if (!me.permissionsIn(message.channel).has(PermissionFlagsBits.ManageWebhooks)) {
+        return message.reply('❌ I need **Manage Webhooks** in this channel specifically.');
+      }
+
+      // Discord allows ~30 requests/min per channel across ALL webhooks, and 5/2s per
+      // individual webhook. Rotating several webhooks lets us actually hit that channel
+      // ceiling instead of throttling on one hook's bucket — but the channel cap is still
+      // the real wall, so a huge count just queues on 429s.
+      const MAX_WEBHOOK_SPAM = 500;
+      if (count > MAX_WEBHOOK_SPAM) {
+        return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}** (Discord caps channels at ~30 msgs/min regardless; higher just 429s).`);
+      }
+
+      // Scale webhook count to volume: 1 for small bursts, up to 10 for big ones.
+      const WEBHOOK_COUNT = Math.max(1, Math.min(10, Math.ceil(count / 15)));
+
+      const progressMsg = await message.reply(`⏳ Setting up ${WEBHOOK_COUNT} webhook(s)...`);
+
+      const createdHooks = [];
+      try {
+        for (let i = 0; i < WEBHOOK_COUNT; i++) {
+          try {
+            const hook = await message.channel.createWebhook({
+              name: `SYNTIX-wspm-${i + 1}`,
+              reason: `Temporary webhook created by owner ${message.author.tag} via ${prefix}wspm`
+            });
+            createdHooks.push(hook);
+          } catch (err) {
+            console.error(`[SYNTIX] Failed to create webhook ${i + 1}/${WEBHOOK_COUNT}:`, err.message);
+          }
+        }
+
+        if (createdHooks.length === 0) {
+          return progressMsg.edit('❌ Failed to create any webhooks. Check my **Manage Webhooks** permission in this channel.');
+        }
+
+        await progressMsg.edit(`⏳ Sending ${count} message(s) via ${createdHooks.length} webhook(s)...`);
+
+        let sent = 0;
+        let failed = 0;
+
+        for (let i = 0; i < count; i++) {
+          const hook = createdHooks[i % createdHooks.length];
+          try {
+            await hook.send({ content: text, username: message.author.username });
+            sent++;
+          } catch (err) {
+            failed++;
+            // On a hard rate limit, back off instead of hammering — otherwise every
+            // remaining send just burns a 429 and the loop finishes "instantly" with
+            // almost nothing actually delivered.
+            if (err.status === 429 && err.retry_after) {
+              await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
+            }
+          }
+        }
+
+        return progressMsg.edit(`✅ Sent **${sent}/${count}** via webhook${failed ? ` (${failed} failed/rate-limited)` : ''}.`);
+      } catch (err) {
+        console.error('[SYNTIX] wspm error:', err);
+        return progressMsg.edit(`❌ Error: ${err.message}`);
+      } finally {
+        // Always clean up the webhooks, even on error — otherwise every run leaves
+        // junk hooks accumulating in the channel.
+        for (const hook of createdHooks) {
+          await hook.delete('SYNTIX wspm cleanup').catch(() => null);
+        }
+      }
     }
 
     // ---- bulk channel creation (two-step conversation) ----
