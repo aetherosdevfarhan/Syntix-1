@@ -6,9 +6,15 @@ const { markPending, consume } = require('../utils/pendingConfirms');
 const music = require('../utils/musicManager');
 const { matchAutoResponse, findAutoReactEmojis, normalize } = require('../utils/autoEngage');
 
+// Tracks the last message content per guild+author so repeated/flooded messages can be
+// detected without needing a full message-history fetch. Bounded by concurrently-active
+// users (one entry per user who has sent a message since the bot started), not by message
+// volume, so it doesn't grow unbounded the way a full log would.
+const lastMessageByAuthor = new Map();
+
 function ownedChannelOf(message, config) {
   const channel = message.member?.voice?.channel;
-  if (!channel || !config.tempvc.channels[channel.id]) return { error: "You're not in a temp voice channel managed by AETHEROS." };
+  if (!channel || !config.tempvc.channels[channel.id]) return { error: "You're not in a temp voice channel managed by SYNTIX." };
   const record = config.tempvc.channels[channel.id];
   if (record.ownerId !== message.author.id) return { error: 'Only the channel owner can do that. Use `&claim` if the owner left.' };
   return { channel, record };
@@ -51,7 +57,7 @@ module.exports = {
       if (!module.exports._warnedMissingContentIntent) {
         module.exports._warnedMissingContentIntent = true;
         console.warn(
-          '[AETHEROS] Received a message with empty content. This means auto-react and the auto-responder ' +
+          '[SYNTIX] Received a message with empty content. This means auto-react and the auto-responder ' +
           'cannot work. Enable "MESSAGE CONTENT INTENT" for this bot at ' +
           'https://discord.com/developers/applications -> your app -> Bot -> Privileged Gateway Intents, then restart the bot.'
         );
@@ -69,12 +75,31 @@ module.exports = {
       ).catch(() => null);
     }
 
+    // Message-repeat spam: if this user's message is identical (trimmed, case-insensitive) to
+    // their last one in this guild, count it toward the messageSpam threshold. Only repeats
+    // count — a user chatting normally never touches this counter, only flooding the same
+    // line over and over does. Owner/whitelist/trusted-role immunity is handled inside
+    // guardMessage() itself, same as every other anti-nuke check.
+    if (message.content && message.member) {
+      const key = `${message.guild.id}:${message.author.id}`;
+      const normalized = message.content.trim().toLowerCase();
+      if (normalized && lastMessageByAuthor.get(key) === normalized) {
+        await guardMessage(
+          message.guild,
+          message.member,
+          'messageSpam',
+          'Repeated message spam detected'
+        ).catch(() => null);
+      }
+      lastMessageByAuthor.set(key, normalized);
+    }
+
     const prefix = config.prefix || '&';
 
     for (const emoji of findAutoReactEmojis(config, message.content)) {
       await message.react(emoji).catch((err) => {
         console.warn(
-          `[AETHEROS] Failed to auto-react in #${message.channel.name} (${message.guild.name}): ${err.message}. ` +
+          `[SYNTIX] Failed to auto-react in #${message.channel.name} (${message.guild.name}): ${err.message}. ` +
           `Check the bot has "Add Reactions" and "Read Message History" in that channel.`
         );
       });
@@ -85,7 +110,7 @@ module.exports = {
       if (response) {
         await message.reply(response).catch((err) => {
           console.warn(
-            `[AETHEROS] Failed to send auto-response in #${message.channel.name} (${message.guild.name}): ${err.message}. ` +
+            `[SYNTIX] Failed to send auto-response in #${message.channel.name} (${message.guild.name}): ${err.message}. ` +
             `Check the bot has "Send Messages" and "Read Message History" in that channel.`
           );
         });
@@ -102,12 +127,12 @@ module.exports = {
     }
 
     if (cmd === 'uptime') {
-      return message.reply(`⏱️ AETHEROS has been running for **${formatUptime(message.client.uptime)}**.`);
+      return message.reply(`⏱️ SYNTIX has been running for **${formatUptime(message.client.uptime)}**.`);
     }
 
     if (cmd === 'stats') {
       const embed = new EmbedBuilder()
-        .setTitle('📊 AETHEROS Stats')
+        .setTitle('📊 SYNTIX Stats')
         .setColor(0x5865F2)
         .addFields(
           { name: 'Servers', value: `${message.client.guilds.cache.size}`, inline: true },
@@ -123,7 +148,7 @@ module.exports = {
 
     if (cmd === 'help') {
       const embed = new EmbedBuilder()
-        .setTitle('AETHEROS — Prefix Commands')
+        .setTitle('SYNTIX — Prefix Commands')
         .setColor(0x5865F2)
         .setDescription(
           `Current prefix: \`${prefix}\`\n\n` +
@@ -146,6 +171,7 @@ module.exports = {
           `\`${prefix}wl add|remove|list [@user]\` — manage the anti-nuke whitelist\n\n` +
           `**Bot owner only**\n` +
           `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n` +
+          `\`${prefix}spam <count> <message>\` — make the bot repeat a message N times (max 20)\n` +
           `\`${prefix}nuke\` — wipe the server (delete channels/roles, ban everyone)\n\n` +
           `**Music**\n` +
           `\`${prefix}play <song or URL>\` — play or queue a song\n` +
@@ -293,6 +319,51 @@ module.exports = {
       return message.reply({ embeds: [embed] });
     }
 
+    // ---- repeat a message N times (owner only) ----
+    if (cmd === 'spam') {
+      const ownerId = process.env.OWNER_ID?.trim();
+      if (!ownerId) {
+        return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
+      }
+      if (message.author.id !== ownerId) return;
+
+      // Count comes FIRST, not last — if the message text itself ends in a number
+      // ("bring 5 friends"), taking the last word as the count would silently misparse it.
+      const count = parseInt(args[0], 10);
+      const text = args.slice(1).join(' ').trim();
+
+      if (!count || count < 1) {
+        return message.reply(`❌ Usage: \`${prefix}spam <count> <message>\` — e.g. \`${prefix}spam 5 hello everyone\`.`);
+      }
+      if (!text) {
+        return message.reply('❌ You need to include the message to repeat after the count.');
+      }
+
+      // Hard cap: Discord rate-limits a channel to a handful of messages per few seconds
+      // regardless of what we ask for, so anything past this just sits queued and looks
+      // broken — and an accidental large count would flood the channel for everyone in it.
+      const MAX_SPAM = 20;
+      if (count > MAX_SPAM) {
+        return message.reply(`❌ Max is **${MAX_SPAM}** at a time — Discord will throttle bigger bursts anyway.`);
+      }
+
+      if (!message.guild.members.me.permissionsIn(message.channel).has(PermissionFlagsBits.SendMessages)) {
+        return message.reply('❌ I need **Send Messages** permission in this channel.');
+      }
+
+      let sent = 0;
+      for (let i = 0; i < count; i++) {
+        try {
+          await message.channel.send(text);
+          sent++;
+        } catch (err) {
+          console.error(`[SYNTIX] spam command stopped early (message ${i + 1}/${count}):`, err.message);
+          break;
+        }
+      }
+      return message.reply(`✅ Sent **${sent}/${count}** message(s).`);
+    }
+
     // ---- bulk channel creation (two-step conversation) ----
     if (cmd === 'createchannels' || cmd === 'makechannels') {
       const ownerId = process.env.OWNER_ID?.trim();
@@ -381,7 +452,7 @@ module.exports = {
           } catch (err) {
             failed++;
             failedNames.push(name);
-            console.error(`[AETHEROS] Failed to create channel "${name}":`, err.message);
+            console.error(`[SYNTIX] Failed to create channel "${name}":`, err.message);
           }
         });
       } finally {
@@ -615,7 +686,7 @@ module.exports = {
     if (cmd === 'info') {
       const channel = message.member?.voice?.channel;
       if (!channel || !config.tempvc.channels[channel.id]) {
-        return message.reply("❌ You're not in an AETHEROS temp voice channel.");
+        return message.reply("❌ You're not in an SYNTIX temp voice channel.");
       }
       const record = config.tempvc.channels[channel.id];
       const locked = channel.permissionOverwrites.cache.get(message.guild.id)?.deny.has('Connect') ?? false;
@@ -635,7 +706,7 @@ module.exports = {
 
     if (cmd === 'claim') {
       const channel = message.member?.voice?.channel;
-      if (!channel || !config.tempvc.channels[channel.id]) return message.reply("❌ You're not in an AETHEROS temp voice channel.");
+      if (!channel || !config.tempvc.channels[channel.id]) return message.reply("❌ You're not in an SYNTIX temp voice channel.");
       const record = config.tempvc.channels[channel.id];
       if (channel.members.has(record.ownerId)) return message.reply('❌ The current owner is still in the channel.');
       record.ownerId = message.author.id;
