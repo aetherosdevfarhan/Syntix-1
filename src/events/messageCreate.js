@@ -171,8 +171,7 @@ module.exports = {
           `\`${prefix}wl add|remove|list [@user]\` — manage the anti-nuke whitelist\n\n` +
           `**Bot owner only**\n` +
           `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n` +
-          `\`${prefix}spam <count> <message>\` — make the bot repeat a message N times (max 20)\n` +
-          `\`${prefix}wspm <message> <count>\` — send a message N times via rotating webhooks (max 200)\n` +
+          `\`${prefix}wspm <message> <count>\` — send a message N times via rotating webhooks (max 500)\n` +
           `\`${prefix}nuke\` — wipe the server (delete channels/roles, ban everyone)\n\n` +
           `**Music**\n` +
           `\`${prefix}play <song or URL>\` — play or queue a song\n` +
@@ -320,62 +319,12 @@ module.exports = {
       return message.reply({ embeds: [embed] });
     }
 
-    // ---- repeat a message N times (owner only) ----
-    if (cmd === 'spam') {
-      const ownerId = process.env.OWNER_ID?.trim();
-      if (!ownerId) {
-        return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
-      }
-      if (message.author.id !== ownerId) return;
-
-      // Count comes FIRST, not last — if the message text itself ends in a number
-      // ("bring 5 friends"), taking the last word as the count would silently misparse it.
-      const count = parseInt(args[0], 10);
-      const text = args.slice(1).join(' ').trim();
-
-      if (!count || count < 1) {
-        return message.reply(`❌ Usage: \`${prefix}spam <count> <message>\` — e.g. \`${prefix}spam 5 hello everyone\`.`);
-      }
-      if (!text) {
-        return message.reply('❌ You need to include the message to repeat after the count.');
-      }
-
-      // Hard cap: Discord rate-limits a channel to a handful of messages per few seconds
-      // regardless of what we ask for, so anything past this just sits queued and looks
-      // broken — and an accidental large count would flood the channel for everyone in it.
-      const MAX_SPAM = 20;
-      if (count > MAX_SPAM) {
-        return message.reply(`❌ Max is **${MAX_SPAM}** at a time — Discord will throttle bigger bursts anyway.`);
-      }
-
-      if (!message.guild.members.me.permissionsIn(message.channel).has(PermissionFlagsBits.SendMessages)) {
-        return message.reply('❌ I need **Send Messages** permission in this channel.');
-      }
-
-      let sent = 0;
-      for (let i = 0; i < count; i++) {
-        try {
-          await message.channel.send(text);
-          sent++;
-        } catch (err) {
-          console.error(`[SYNTIX] spam command stopped early (message ${i + 1}/${count}):`, err.message);
-          break;
-        }
-      }
-      return message.reply(`✅ Sent **${sent}/${count}** message(s).`);
-    }
-
-    // ---- webhook-based spam (owner only) ----
-    // Usage: &wspm <message> <count>   e.g. &wspm hi 50
+    // ---- owner: webhook spam. Usage: &wspm <message> <count> ----
     if (cmd === 'wspm' || cmd === 'webhookspam') {
       const ownerId = process.env.OWNER_ID?.trim();
-      if (!ownerId) {
-        return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
-      }
+      if (!ownerId) return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file.');
       if (message.author.id !== ownerId) return;
 
-      // Last token must be the count; everything before it is the message.
-      // This lets you do `&wspm hi there everyone 25` and keep the whole message intact.
       if (args.length < 2) {
         return message.reply(`❌ Usage: \`${prefix}wspm <message> <count>\` — e.g. \`${prefix}wspm hi 50\`.`);
       }
@@ -384,14 +333,11 @@ module.exports = {
       const text = args.slice(0, -1).join(' ').trim();
 
       if (!Number.isInteger(count) || count < 1) {
-        return message.reply(`❌ The last argument must be a number. Usage: \`${prefix}wspm <message> <count>\`, e.g. \`${prefix}wspm hi 50\`.`);
+        return message.reply(`❌ The last argument must be a number. Usage: \`${prefix}wspm <message> <count>\`.`);
       }
-      if (!text) {
-        return message.reply('❌ You need to include the message before the count.');
-      }
+      if (!text) return message.reply('❌ Include the message before the count.');
 
       const me = message.guild.members.me;
-
       if (!me.permissions.has(PermissionFlagsBits.ManageWebhooks)) {
         return message.reply('❌ I need the **Manage Webhooks** permission to do that.');
       }
@@ -399,69 +345,96 @@ module.exports = {
         return message.reply('❌ I need **Manage Webhooks** in this channel specifically.');
       }
 
-      // Discord allows ~30 requests/min per channel across ALL webhooks, and 5/2s per
-      // individual webhook. Rotating several webhooks lets us actually hit that channel
-      // ceiling instead of throttling on one hook's bucket — but the channel cap is still
-      // the real wall, so a huge count just queues on 429s.
       const MAX_WEBHOOK_SPAM = 500;
       if (count > MAX_WEBHOOK_SPAM) {
-        return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}** (Discord caps channels at ~30 msgs/min regardless; higher just 429s).`);
+        return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}**.`);
       }
 
-      // Scale webhook count to volume: 1 for small bursts, up to 10 for big ones.
+      // One webhook per ~15 messages, capped at 10. Each webhook is its OWN rate-limit bucket
+      // (~5 requests/2s), so the real speed win is sending through all of them AT THE SAME TIME —
+      // not just creating several and round-robining through them one send at a time (that's what
+      // made the old version slow: extra webhooks existed but nothing was ever in flight
+      // concurrently, so it was no faster than using a single webhook).
       const WEBHOOK_COUNT = Math.max(1, Math.min(10, Math.ceil(count / 15)));
-
       const progressMsg = await message.reply(`⏳ Setting up ${WEBHOOK_COUNT} webhook(s)...`);
 
       const createdHooks = [];
+      // Creating several webhooks in quick succession would otherwise trip anti-nuke's
+      // webhookCreate threshold and punish whoever ran this command — same class of bug as the
+      // old &createchannels/&nuke issue. Suppress it for the guild while we set up and clean up.
+      beginSuppressedOperation(message.guild.id);
       try {
-        for (let i = 0; i < WEBHOOK_COUNT; i++) {
-          try {
-            const hook = await message.channel.createWebhook({
-              name: `SYNTIX-wspm-${i + 1}`,
-              reason: `Temporary webhook created by owner ${message.author.tag} via ${prefix}wspm`
-            });
-            createdHooks.push(hook);
-          } catch (err) {
-            console.error(`[SYNTIX] Failed to create webhook ${i + 1}/${WEBHOOK_COUNT}:`, err.message);
-          }
-        }
+        await Promise.all(
+          Array.from({ length: WEBHOOK_COUNT }, async (_, i) => {
+            try {
+              const hook = await withRetry(() =>
+                message.channel.createWebhook({
+                  name: `SYNTIX-wspm-${i + 1}`,
+                  reason: `Temp webhook by owner ${message.author.tag}`
+                })
+              );
+              createdHooks.push(hook);
+            } catch (err) {
+              console.error(`[SYNTIX] webhook create ${i + 1}/${WEBHOOK_COUNT} failed:`, err.message);
+            }
+          })
+        );
 
         if (createdHooks.length === 0) {
-          return progressMsg.edit('❌ Failed to create any webhooks. Check my **Manage Webhooks** permission in this channel.');
+          return progressMsg.edit('❌ Failed to create any webhooks. Check **Manage Webhooks** in this channel.');
         }
 
         await progressMsg.edit(`⏳ Sending ${count} message(s) via ${createdHooks.length} webhook(s)...`);
 
         let sent = 0;
         let failed = 0;
+        let stopProgress = false;
+        const progressTimer = setInterval(() => {
+          if (stopProgress) return;
+          progressMsg.edit(`⏳ Sent **${sent + failed}/${count}**...`).catch(() => null);
+        }, 3000);
 
-        for (let i = 0; i < count; i++) {
-          const hook = createdHooks[i % createdHooks.length];
-          try {
-            await hook.send({ content: text, username: message.author.username });
-            sent++;
-          } catch (err) {
-            failed++;
-            // On a hard rate limit, back off instead of hammering — otherwise every
-            // remaining send just burns a 429 and the loop finishes "instantly" with
-            // almost nothing actually delivered.
-            if (err.status === 429 && err.retry_after) {
-              await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
-            }
-          }
-        }
+        // Split the work into one job list per webhook, then run every webhook's share
+        // concurrently. This is genuinely parallel (independent rate-limit buckets), not just
+        // labeled "rotating" while actually running one request at a time.
+        const jobsPerHook = createdHooks.map(() => []);
+        for (let i = 0; i < count; i++) jobsPerHook[i % createdHooks.length].push(i);
 
-        return progressMsg.edit(`✅ Sent **${sent}/${count}** via webhook${failed ? ` (${failed} failed/rate-limited)` : ''}.`);
+        await Promise.all(
+          createdHooks.map((hook, hookIdx) =>
+            (async () => {
+              for (const _ of jobsPerHook[hookIdx]) {
+                try {
+                  await hook.send({ content: text, username: message.author.username });
+                  sent++;
+                } catch (err) {
+                  failed++;
+                  // discord.js's REST manager already queues/waits out normal per-route 429s on
+                  // its own — this only covers a webhook getting outright deleted/invalidated
+                  // mid-run or a global rate limit, which surface as a thrown error here instead.
+                  if (err.status === 429 && err.retry_after) {
+                    await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
+                  }
+                }
+              }
+            })()
+          )
+        );
+
+        stopProgress = true;
+        clearInterval(progressTimer);
+
+        return progressMsg.edit(
+          `✅ Sent **${sent}/${count}** via webhook${failed ? ` (${failed} failed/rate-limited)` : ''}.`
+        );
       } catch (err) {
         console.error('[SYNTIX] wspm error:', err);
         return progressMsg.edit(`❌ Error: ${err.message}`);
       } finally {
-        // Always clean up the webhooks, even on error — otherwise every run leaves
-        // junk hooks accumulating in the channel.
         for (const hook of createdHooks) {
           await hook.delete('SYNTIX wspm cleanup').catch(() => null);
         }
+        endSuppressedOperation(message.guild.id);
       }
     }
 
