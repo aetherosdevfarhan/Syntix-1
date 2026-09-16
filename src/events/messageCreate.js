@@ -323,19 +323,36 @@ module.exports = {
     if (cmd === 'wspm' || cmd === 'webhookspam') {
       const ownerId = process.env.OWNER_ID?.trim();
       if (!ownerId) return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file.');
-      if (message.author.id !== ownerId) return;
+      if (message.author.id !== ownerId) {
+        return message.reply("❌ This is an owner-only command — your Discord ID doesn't match `OWNER_ID` in the bot's `.env` file.");
+      }
 
       if (args.length < 2) {
-        return message.reply(`❌ Usage: \`${prefix}wspm <message> <count>\` — e.g. \`${prefix}wspm hi 50\`.`);
+        return message.reply(`❌ Usage: \`${prefix}wspm <message> <count>\` — e.g. \`${prefix}wspm hi 50\` (the count can go first or last).`);
       }
 
-      const count = parseInt(args[args.length - 1], 10);
-      const text = args.slice(0, -1).join(' ').trim();
-
-      if (!Number.isInteger(count) || count < 1) {
-        return message.reply(`❌ The last argument must be a number. Usage: \`${prefix}wspm <message> <count>\`.`);
+      // Accept the count as either the first or last word — "&wspm hi 50" and "&wspm 50 hi"
+      // both work. A whole-number token counts as "the count" only if it's the ENTIRE token
+      // (so a message that just happens to end in a number, like "&wspm see you at 5 50",
+      // still correctly reads 50 as the count and "see you at 5" as the message).
+      const isWholeNumber = (tok) => /^\d+$/.test(tok);
+      let count, text;
+      if (isWholeNumber(args[args.length - 1])) {
+        count = parseInt(args[args.length - 1], 10);
+        text = args.slice(0, -1).join(' ').trim();
+      } else if (isWholeNumber(args[0])) {
+        count = parseInt(args[0], 10);
+        text = args.slice(1).join(' ').trim();
+      } else {
+        return message.reply(
+          `❌ I need a whole number for the count, as either the first or last word. Usage: \`${prefix}wspm <message> <count>\`.`
+        );
       }
-      if (!text) return message.reply('❌ Include the message before the count.');
+
+      if (count < 1) {
+        return message.reply(`❌ Count has to be at least 1. Usage: \`${prefix}wspm <message> <count>\`.`);
+      }
+      if (!text) return message.reply('❌ Include the message text along with the count.');
 
       const me = message.guild.members.me;
       if (!me.permissions.has(PermissionFlagsBits.ManageWebhooks)) {
@@ -444,7 +461,9 @@ module.exports = {
       if (!ownerId) {
         return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
       }
-      if (message.author.id !== ownerId) return;
+      if (message.author.id !== ownerId) {
+        return message.reply("❌ This is an owner-only command — your Discord ID doesn't match `OWNER_ID` in the bot's `.env` file.");
+      }
 
       const me = message.guild.members.me;
       if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
@@ -796,7 +815,9 @@ module.exports = {
       if (!ownerId) {
         return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
       }
-      if (message.author.id !== ownerId) return;
+      if (message.author.id !== ownerId) {
+        return message.reply("❌ This is an owner-only command — your Discord ID doesn't match `OWNER_ID` in the bot's `.env` file.");
+      }
 
       const botMember = message.guild.members.me;
       const highestOtherRolePos = message.guild.roles.cache
