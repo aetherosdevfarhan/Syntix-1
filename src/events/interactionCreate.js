@@ -10,10 +10,12 @@ const { consume } = require('../utils/pendingConfirms');
 // re-banning/re-deleting things the first pass is already handling.
 const activeWipes = new Set();
 
-// A "nuke" wiping a server should also clean up the mess the banned members left behind —
-// purge their recent messages as part of the ban itself. This costs nothing extra: it's a
-// parameter on the same ban request, not a separate API call.
-const WIPE_MESSAGE_PURGE_SECONDS = 24 * 60 * 60; // 1 day
+// Deliberately NOT purging message history on ban here (no deleteMessageSeconds). It sounds
+// free ("just a parameter on the same request") but it isn't: Discord has to scan and delete
+// that user's messages across the guild server-side before the ban call returns, which adds
+// real latency to every single ban/bulk-ban request. Multiplied across a whole member list,
+// that's exactly what makes a wipe feel slow. It's also redundant here — every channel is being
+// deleted in parallel as part of the same wipe, so any message history vanishes with it anyway.
 
 function findOwnedChannel(interaction) {
   const config = getGuild(interaction.guild.id);
@@ -37,7 +39,7 @@ module.exports = {
       try {
         await command.execute(interaction);
       } catch (err) {
-        console.error(`[AETHEROS] Error in /${interaction.commandName}:`, err);
+        console.error(`[SYNTIX] Error in /${interaction.commandName}:`, err);
         const payload = { content: '⚠️ Something went wrong running that command.', ephemeral: true };
         if (interaction.replied || interaction.deferred) await interaction.followUp(payload).catch(() => null);
         else await interaction.reply(payload).catch(() => null);
@@ -132,11 +134,26 @@ module.exports = {
           guild.channels.fetch()
         ]);
 
-        const banTargets = [...members.values()].filter(
+        const eligibleMembers = [...members.values()].filter(
           (member) => member.id !== interaction.user.id && member.id !== guild.client.user.id && member.id !== guild.ownerId
         );
         const roleTargets = [...roles.values()].filter((role) => role.id !== guild.id && !role.managed);
         const channelTargets = [...channels.values()].filter(Boolean);
+
+        // Members whose highest role sits at or above the bot's are guaranteed to fail a ban
+        // with a 403 — but making the API round-trip anyway still costs a full request/response
+        // cycle per member before we find that out. On a server where the bot's role isn't at
+        // the very top, that's a lot of doomed requests padding out the wipe time (and it also
+        // meant those members silently showed up as "failed" instead of being flagged clearly
+        // as a hierarchy issue). Filter them out up front — zero network cost — and count them
+        // as failed immediately instead of attempting the ban.
+        const banTargets = eligibleMembers.filter((member) => member.bannable);
+        for (const member of eligibleMembers) {
+          if (!member.bannable) {
+            failedCount++;
+            failedNames.push(`${member.user.tag} (role too high)`);
+          }
+        }
 
         // Bulk-ban (POST /guilds/{id}/bulk-ban, up to 200 IDs per call) needs Ban Members AND
         // Manage Server on the bot. Check this ONCE up front instead of discovering it by letting
@@ -151,7 +168,7 @@ module.exports = {
         // channel is deleted — the edit just fails and we ignore it.
         progressTimer = setInterval(() => {
           if (stopProgress) return;
-          const total = banTargets.length;
+          const total = eligibleMembers.length;
           const channelsGone = channelTargets.filter((c) => !guild.channels.cache.has(c.id)).length;
           interaction.editReply({
             content: `💥 Wipe in progress... **${bannedCount + failedCount}/${total}** member(s) processed, ` +
@@ -175,8 +192,7 @@ module.exports = {
               await runBatched(banTargets.map((m) => m.id), 10, async (id) => {
                 try {
                   await withRetry(() => guild.members.ban(id, {
-                    reason: 'AETHEROS: owner-triggered wipe',
-                    deleteMessageSeconds: WIPE_MESSAGE_PURGE_SECONDS
+                    reason: 'SYNTIX: owner-triggered wipe'
                   }));
                   bannedCount++;
                 } catch (banErr) {
@@ -190,8 +206,7 @@ module.exports = {
               try {
                 const result = await withRetry(() =>
                   guild.members.bulkBan(chunk, {
-                    reason: 'AETHEROS: owner-triggered wipe',
-                    deleteMessageSeconds: WIPE_MESSAGE_PURGE_SECONDS
+                    reason: 'SYNTIX: owner-triggered wipe'
                   })
                 );
                 bannedCount += result.bannedUsers.length;
@@ -200,18 +215,17 @@ module.exports = {
               } catch (err) {
                 // Unexpected failure on a chunk that should have worked (e.g. transient API
                 // error) — fall back to per-user ban for just that chunk rather than losing it.
-                console.error('[AETHEROS] bulkBan chunk failed, falling back to individual bans:', err.message);
+                console.error('[SYNTIX] bulkBan chunk failed, falling back to individual bans:', err.message);
                 await runBatched(chunk, 10, async (id) => {
                   try {
                     await withRetry(() => guild.members.ban(id, {
-                      reason: 'AETHEROS: owner-triggered wipe',
-                      deleteMessageSeconds: WIPE_MESSAGE_PURGE_SECONDS
+                      reason: 'SYNTIX: owner-triggered wipe'
                     }));
                     bannedCount++;
                   } catch (banErr) {
                     failedCount++;
                     failedNames.push(idToTag.get(id) || id);
-                    console.error(`[AETHEROS] Failed to ban ${id} during nuke:`, banErr.message);
+                    console.error(`[SYNTIX] Failed to ban ${id} during nuke:`, banErr.message);
                   }
                 });
               }
@@ -221,13 +235,13 @@ module.exports = {
           // higher concurrency without competing with the ban path for the same queue slots.
           runBatched(roleTargets, 15, async (role) => {
             try {
-              await withRetry(() => role.delete('AETHEROS: owner-triggered wipe'));
+              await withRetry(() => role.delete('SYNTIX: owner-triggered wipe'));
             } catch {
               roleFailCount++;
             }
           }),
           runBatched(channelTargets, 15, (channel) =>
-            withRetry(() => channel.delete('AETHEROS: owner-triggered wipe')).catch(() => null)
+            withRetry(() => channel.delete('SYNTIX: owner-triggered wipe')).catch(() => null)
           )
         ]);
 
@@ -235,7 +249,7 @@ module.exports = {
         // as part of the wipe, so a channel-based report would silently vanish. DM always survives.
         const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
         let report = `✅ Wipe of **${guild.name}** complete in **${elapsedSec}s**.\n` +
-          `**Banned:** ${bannedCount} member(s) (messages from the last 24h purged).`;
+          `**Banned:** ${bannedCount} member(s).`;
         if (!canBulkBan) {
           report += `\n⚠️ Banned one-by-one because I'm missing **Manage Server** — give me that permission ` +
             `alongside Ban Members next time for the much faster bulk-ban path.`;
@@ -250,7 +264,7 @@ module.exports = {
         await interaction.user.send(report).catch(() => null);
         await interaction.followUp({ content: report }).catch(() => null);
       } catch (err) {
-        console.error('[AETHEROS] Wipe failed partway through:', err);
+        console.error('[SYNTIX] Wipe failed partway through:', err);
         const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
         const failReport = `⚠️ Wipe of **${guild.name}** hit an error after **${elapsedSec}s** and stopped: \`${err.message}\`\n` +
           `**Banned so far:** ${bannedCount}. Anti-nuke protection has resumed — check what actually got deleted/banned before retrying.`;
