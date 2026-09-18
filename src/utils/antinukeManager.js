@@ -1,7 +1,46 @@
-const { AuditLogEvent, PermissionsBitField } = require('discord.js');
+const { AuditLogEvent, PermissionsBitField, EmbedBuilder, ActionRowBuilder, UserSelectMenuBuilder } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
 const { sendLog } = require('./logger');
 const { withRetry } = require('./retry');
+
+const WHITELIST_SELECT_ID = 'aeth_wl_select';
+// Discord's own hard cap on how many values a select menu can hold/return in one interaction.
+const WHITELIST_PANEL_MAX = 25;
+
+// Builds the embed + select menu for the interactive whitelist panel (&wl with no arguments).
+// The select menu is pre-ticked with everyone currently whitelisted (via setDefaultUsers) —
+// ticking someone new adds them, unticking someone removes them, all in one submit. Shared
+// between messageCreate.js (first render) and interactionCreate.js (re-render after a change)
+// so the two never drift out of sync with each other.
+function buildWhitelistPanel(config) {
+  const ids = config.antinuke.whitelist;
+  const shown = ids.slice(0, WHITELIST_PANEL_MAX);
+  const overflowCount = ids.length - shown.length;
+
+  const embed = new EmbedBuilder()
+    .setTitle('🛡️ Anti-Nuke Whitelist')
+    .setColor(0x5865F2)
+    .setDescription(
+      `Tick someone to **whitelist** them, untick someone to **remove** them — changes save as soon as you pick.\n\n` +
+      `Currently whitelisted: **${ids.length}**` +
+      (overflowCount > 0
+        ? `\n⚠️ Only the first ${WHITELIST_PANEL_MAX} are shown/editable here (Discord's limit per menu). ` +
+          `${overflowCount} more exist beyond that — manage those with \`&wl remove @user\`.`
+        : '')
+    )
+    .setFooter({ text: "The server owner is always immune and doesn't need to be added." });
+
+  const select = new UserSelectMenuBuilder()
+    .setCustomId(WHITELIST_SELECT_ID)
+    .setPlaceholder('Select whitelisted members...')
+    .setMinValues(0)
+    .setMaxValues(WHITELIST_PANEL_MAX);
+
+  if (shown.length) select.setDefaultUsers(shown);
+
+  const row = new ActionRowBuilder().addComponents(select);
+  return { embed, row };
+}
 
 const activity = new Map();
 const punishedRecently = new Map();
@@ -186,5 +225,8 @@ module.exports = {
   DANGEROUS_PERMS,
   beginSuppressedOperation,
   endSuppressedOperation,
-  isSuppressed
+  isSuppressed,
+  buildWhitelistPanel,
+  WHITELIST_SELECT_ID,
+  WHITELIST_PANEL_MAX
 };
