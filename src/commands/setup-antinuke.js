@@ -5,11 +5,12 @@ const {
   EmbedBuilder
 } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
+const { isModuleEnabled, MODULE_DEFS } = require('../utils/antinukeManager');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('setup-antinuke')
-    .setDescription('Configure AETHEROS Anti-Nuke protection.')
+    .setDescription('Configure SYNTIX Anti-Nuke protection.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand(sub =>
       sub.setName('enable')
@@ -60,8 +61,12 @@ module.exports = {
               { name: 'Role Delete', value: 'roleDelete' },
               { name: 'Role Create', value: 'roleCreate' },
               { name: 'Ban', value: 'ban' },
+              { name: 'Unban', value: 'unban' },
               { name: 'Kick', value: 'kick' },
-              { name: 'Webhook Create', value: 'webhookCreate' }
+              { name: 'Webhook Create', value: 'webhookCreate' },
+              { name: 'Everyone/Here Ping', value: 'mentionSpam' },
+              { name: 'Message Spam', value: 'messageSpam' },
+              { name: 'Member Prune (min. members removed)', value: 'memberPrune' }
             ))
         .addIntegerOption(opt => opt.setName('count').setDescription('Number of actions').setRequired(true).setMinValue(1))
         .addIntegerOption(opt => opt.setName('seconds').setDescription('Time window in seconds').setRequired(true).setMinValue(2))
@@ -159,7 +164,7 @@ module.exports = {
         .setTitle('🛡️ Anti-Nuke enabled')
         .setColor(0x57F287)
         .setDescription(
-          `AETHEROS is now guarding this server against mass-ban, mass-kick, channel/role nuking, ` +
+          `SYNTIX is now guarding this server against mass-ban, mass-kick, channel/role nuking, ` +
           `unauthorized webhooks, and unauthorized bot additions.\nAlerts will be posted in ${logChannel}.`
         );
       return interaction.reply({ embeds: [embed] });
@@ -186,6 +191,10 @@ module.exports = {
           {
             name: 'Thresholds',
             value: Object.entries(t).map(([k, v]) => `\`${k}\`: ${v.count} / ${v.seconds}s`).join('\n')
+          },
+          {
+            name: 'Modules',
+            value: MODULE_DEFS.map(d => `${isModuleEnabled(config, d.key) ? '🟩' : '🟥'} ${d.label}`).join('\n')
           }
         );
       return interaction.reply({ embeds: [embed], ephemeral: true });
