@@ -1,4 +1,4 @@
-const { AuditLogEvent, PermissionsBitField, EmbedBuilder, ActionRowBuilder, UserSelectMenuBuilder } = require('discord.js');
+const { AuditLogEvent, PermissionsBitField, EmbedBuilder, ActionRowBuilder, UserSelectMenuBuilder, StringSelectMenuBuilder } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
 const { sendLog } = require('./logger');
 const { withRetry } = require('./retry');
@@ -8,7 +8,7 @@ const WHITELIST_SELECT_ID = 'aeth_wl_select';
 const WHITELIST_PANEL_MAX = 25;
 
 // Builds the embed + select menu for the interactive whitelist panel (&wl with no arguments).
-// The select menu is pre-ticked with everyone currently whitelisted (via setDefaultUsers) —
+// The select menu is pre-ticked with everyone currently whitelisted (via setDefaultUsers)
 // ticking someone new adds them, unticking someone removes them, all in one submit. Shared
 // between messageCreate.js (first render) and interactionCreate.js (re-render after a change)
 // so the two never drift out of sync with each other.
@@ -44,6 +44,79 @@ function buildWhitelistPanel(config) {
 
 const activity = new Map();
 const punishedRecently = new Map();
+
+// Every real, currently-implemented anti-nuke protection, in display order. Two of them
+// ("botAdd", "roleUpdate") are backed by the older allowBotAdd/allowDangerousPerms booleans
+// instead of antinuke.modules — isModuleEnabled/setModuleEnabled below hide that distinction
+// from everything else, so guard()/guardMessage()/the panel don't need to care.
+const MODULE_SELECT_ID = 'aeth_modules_select';
+const MODULE_DEFS = [
+  { key: 'ban', label: 'Anti Ban' },
+  { key: 'unban', label: 'Anti Unban' },
+  { key: 'kick', label: 'Anti Kick' },
+  { key: 'memberPrune', label: 'Anti Member Prune' },
+  { key: 'botAdd', label: 'Anti Bot Add', legacyField: 'allowBotAdd' },
+  { key: 'channelCreate', label: 'Anti Channel Create' },
+  { key: 'channelDelete', label: 'Anti Channel Delete' },
+  { key: 'roleCreate', label: 'Anti Role Create' },
+  { key: 'roleDelete', label: 'Anti Role Delete' },
+  { key: 'roleUpdate', label: 'Anti Dangerous Perm Grant', legacyField: 'allowDangerousPerms' },
+  { key: 'webhookCreate', label: 'Anti Webhook Create' },
+  { key: 'mentionSpam', label: 'Anti Everyone/Here Ping' },
+  { key: 'messageSpam', label: 'Anti Message Spam' }
+];
+
+function isModuleEnabled(config, key) {
+  const def = MODULE_DEFS.find(d => d.key === key);
+  // legacyField booleans are "allow X" (true = protection OFF), inverted from modules{} (true = ON).
+  if (def?.legacyField) return !config.antinuke[def.legacyField];
+  return config.antinuke.modules?.[key] !== false;
+}
+
+function setModuleEnabled(config, key, enabled) {
+  const def = MODULE_DEFS.find(d => d.key === key);
+  if (def?.legacyField) {
+    config.antinuke[def.legacyField] = !enabled;
+    return;
+  }
+  if (!config.antinuke.modules) config.antinuke.modules = {};
+  config.antinuke.modules[key] = enabled;
+}
+
+// Builds the embed + toggle select for `&modules` — visually the same pattern as the reference
+// screenshot (one row per protection, a clear on/off state) but implemented as a multi-select
+// the admin submits once, since Discord buttons can't hold 13 individually-labelled toggles
+// without spanning more action rows than a message allows.
+function buildModulesPanel(config) {
+  const lines = MODULE_DEFS.map(d => `${isModuleEnabled(config, d.key) ? '🟩' : '🟥'} : ${d.label}`);
+
+  const embed = new EmbedBuilder()
+    .setTitle('🛡️ Anti-Nuke Modules')
+    .setColor(0x5865F2)
+    .setDescription(
+      `${lines.join('\n')}\n\n` +
+      `Use the dropdown below to change what's protected — everything ticked stays **on**, ` +
+      `untick something to turn it **off**. Changes save as soon as you submit.` +
+      (config.antinuke.enabled ? '' : '\n\n⚠️ Anti-Nuke is currently **disabled overall** (`&antinukeenable`) — these modules won\'t do anything until it\'s on.')
+    );
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(MODULE_SELECT_ID)
+    .setPlaceholder('Choose which protections are enabled...')
+    .setMinValues(0)
+    .setMaxValues(MODULE_DEFS.length)
+    .addOptions(
+      MODULE_DEFS.map(d => ({
+        label: d.label,
+        value: d.key,
+        default: isModuleEnabled(config, d.key)
+      }))
+    );
+
+  const row = new ActionRowBuilder().addComponents(select);
+  return { embed, row };
+}
+
 // Guilds currently running a bot-initiated bulk operation (nuke wipe, &createchannels, etc).
 // While a guild is in here, guard()/guardMessage() bail out instantly instead of doing an
 // audit-log fetch per event. Without this, every single ban/channel-create fired during a bulk
@@ -72,7 +145,6 @@ function isSuppressed(guildId) {
   const expiresAt = suppressedGuilds.get(guildId);
   if (expiresAt === undefined) return false;
   if (Date.now() > expiresAt) {
-    // Expired safety net — clear it so we don't keep checking a stale entry.
     suppressedGuilds.delete(guildId);
     return false;
   }
@@ -145,7 +217,7 @@ async function punish(guild, config, executorId, reason) {
     if (config.antinuke.punishment === 'strip_ban' || config.antinuke.punishment === 'strip_only') {
       const removable = member.roles.cache.filter(r => r.id !== guild.id && r.editable);
       if (removable.size) {
-        await withRetry(() => member.roles.remove(removable, `AETHEROS Anti-Nuke: ${reason}`));
+        await withRetry(() => member.roles.remove(removable, `SYNTIX Anti-Nuke: ${reason}`));
         actionsTaken.push('roles stripped');
       }
     }
@@ -154,12 +226,12 @@ async function punish(guild, config, executorId, reason) {
   try {
     if (config.antinuke.punishment === 'strip_ban') {
       if (member.bannable) {
-        await withRetry(() => member.ban({ reason: `AETHEROS Anti-Nuke: ${reason}` }));
+        await withRetry(() => member.ban({ reason: `SYNTIX Anti-Nuke: ${reason}` }));
         actionsTaken.push('banned');
       }
     } else if (config.antinuke.punishment === 'strip_kick') {
       if (member.kickable) {
-        await withRetry(() => member.kick(`AETHEROS Anti-Nuke: ${reason}`));
+        await withRetry(() => member.kick(`SYNTIX Anti-Nuke: ${reason}`));
         actionsTaken.push('kicked');
       }
     }
@@ -180,6 +252,7 @@ async function guard(guild, actionKey, auditLogEvent, targetId, extraReason) {
   if (isSuppressed(guild.id)) return;
   const config = getGuild(guild.id);
   if (!config.antinuke.enabled) return;
+  if (!isModuleEnabled(config, actionKey)) return;
   const threshold = config.antinuke.thresholds[actionKey];
   if (!threshold) return;
 
@@ -206,6 +279,7 @@ async function guardMessage(guild, member, actionKey, reason) {
   if (isSuppressed(guild.id)) return;
   const config = getGuild(guild.id);
   if (!config.antinuke.enabled) return;
+  if (!isModuleEnabled(config, actionKey)) return;
   const threshold = config.antinuke.thresholds[actionKey];
   if (!threshold) return;
   if (isImmune(guild, config, member)) return;
@@ -228,5 +302,10 @@ module.exports = {
   isSuppressed,
   buildWhitelistPanel,
   WHITELIST_SELECT_ID,
-  WHITELIST_PANEL_MAX
+  WHITELIST_PANEL_MAX,
+  buildModulesPanel,
+  MODULE_SELECT_ID,
+  MODULE_DEFS,
+  isModuleEnabled,
+  setModuleEnabled
 };
