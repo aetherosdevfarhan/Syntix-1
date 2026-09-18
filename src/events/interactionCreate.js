@@ -1,7 +1,7 @@
 const { Events, ChannelType, EmbedBuilder, ActionRowBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, PermissionFlagsBits } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
 const { PANEL_ID } = require('../utils/tempVCManager');
-const { beginSuppressedOperation, endSuppressedOperation } = require('../utils/antinukeManager');
+const { beginSuppressedOperation, endSuppressedOperation, buildWhitelistPanel, WHITELIST_SELECT_ID } = require('../utils/antinukeManager');
 const { withRetry } = require('../utils/retry');
 const { consume } = require('../utils/pendingConfirms');
 
@@ -68,6 +68,25 @@ module.exports = {
         return interaction.reply({ content: `🔢 Limit set to ${num === 0 ? 'unlimited' : num}.`, ephemeral: true });
       }
       return;
+    }
+
+    // ---- anti-nuke whitelist panel (interactive select menu from &wl) ----
+    if (interaction.isUserSelectMenu() && interaction.customId === WHITELIST_SELECT_ID) {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ content: '❌ You need **Administrator** to manage the whitelist.', ephemeral: true });
+      }
+
+      const config = getGuild(interaction.guild.id);
+      const ids = config.antinuke.whitelist;
+      // Anything beyond the panel's 25-slot display window wasn't shown/editable in this
+      // interaction at all, so it must be preserved untouched rather than dropped.
+      const overflow = ids.slice(25);
+      const newlySelected = interaction.values.filter((id) => id !== interaction.guild.ownerId);
+      config.antinuke.whitelist = [...new Set([...overflow, ...newlySelected])];
+      saveGuild(interaction.guild.id, config);
+
+      const { embed, row } = buildWhitelistPanel(config);
+      return interaction.update({ embeds: [embed], components: [row] });
     }
 
     // ---- owner-only server wipe confirmation ----
