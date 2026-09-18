@@ -1,6 +1,6 @@
 const { Events, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const { getGuild, saveGuild } = require('../database/db');
-const { guardMessage, beginSuppressedOperation, endSuppressedOperation } = require('../utils/antinukeManager');
+const { guardMessage, beginSuppressedOperation, endSuppressedOperation, buildWhitelistPanel, buildModulesPanel } = require('../utils/antinukeManager');
 const { withRetry } = require('../utils/retry');
 const { markPending, consume } = require('../utils/pendingConfirms');
 const music = require('../utils/musicManager');
@@ -168,7 +168,8 @@ module.exports = {
           `**Anti-Nuke** (admin only)\n` +
           `\`${prefix}antinukeenable [#logchannel]\` — enable protection\n` +
           `\`${prefix}antinukedisable\` — disable protection\n` +
-          `\`${prefix}wl add|remove|list [@user]\` — manage the anti-nuke whitelist\n\n` +
+          `\`${prefix}wl [add|remove|list] [@user]\` — manage the anti-nuke whitelist (no args = interactive panel)\n` +
+          `\`${prefix}modules\` — toggle individual anti-nuke protections on/off\n\n` +
           `**Bot owner only**\n` +
           `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n` +
           `\`${prefix}wspm <message> <count>\` — send a message N times via rotating webhooks (max 500)\n` +
@@ -331,10 +332,6 @@ module.exports = {
         return message.reply(`❌ Usage: \`${prefix}wspm <message> <count>\` — e.g. \`${prefix}wspm hi 50\` (the count can go first or last).`);
       }
 
-      // Accept the count as either the first or last word — "&wspm hi 50" and "&wspm 50 hi"
-      // both work. A whole-number token counts as "the count" only if it's the ENTIRE token
-      // (so a message that just happens to end in a number, like "&wspm see you at 5 50",
-      // still correctly reads 50 as the count and "see you at 5" as the message).
       const isWholeNumber = (tok) => /^\d+$/.test(tok);
       let count, text;
       if (isWholeNumber(args[args.length - 1])) {
@@ -367,18 +364,10 @@ module.exports = {
         return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}**.`);
       }
 
-      // One webhook per ~15 messages, capped at 10. Each webhook is its OWN rate-limit bucket
-      // (~5 requests/2s), so the real speed win is sending through all of them AT THE SAME TIME —
-      // not just creating several and round-robining through them one send at a time (that's what
-      // made the old version slow: extra webhooks existed but nothing was ever in flight
-      // concurrently, so it was no faster than using a single webhook).
       const WEBHOOK_COUNT = Math.max(1, Math.min(10, Math.ceil(count / 15)));
       const progressMsg = await message.reply(`⏳ Setting up ${WEBHOOK_COUNT} webhook(s)...`);
 
       const createdHooks = [];
-      // Creating several webhooks in quick succession would otherwise trip anti-nuke's
-      // webhookCreate threshold and punish whoever ran this command — same class of bug as the
-      // old &createchannels/&nuke issue. Suppress it for the guild while we set up and clean up.
       beginSuppressedOperation(message.guild.id);
       try {
         await Promise.all(
@@ -411,9 +400,6 @@ module.exports = {
           progressMsg.edit(`⏳ Sent **${sent + failed}/${count}**...`).catch(() => null);
         }, 3000);
 
-        // Split the work into one job list per webhook, then run every webhook's share
-        // concurrently. This is genuinely parallel (independent rate-limit buckets), not just
-        // labeled "rotating" while actually running one request at a time.
         const jobsPerHook = createdHooks.map(() => []);
         for (let i = 0; i < count; i++) jobsPerHook[i % createdHooks.length].push(i);
 
@@ -426,9 +412,6 @@ module.exports = {
                   sent++;
                 } catch (err) {
                   failed++;
-                  // discord.js's REST manager already queues/waits out normal per-route 429s on
-                  // its own — this only covers a webhook getting outright deleted/invalidated
-                  // mid-run or a global rate limit, which surface as a thrown error here instead.
                   if (err.status === 429 && err.retry_after) {
                     await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
                   }
@@ -530,9 +513,6 @@ module.exports = {
         await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
       }
 
-      // Suppress anti-nuke for this guild while we blast out channel creates — otherwise each
-      // one fires a channelCreate guard() (audit-log fetch) and can trip the channelCreate
-      // threshold, getting the person running this command punished by their own bot.
       beginSuppressedOperation(message.guild.id);
       try {
         await runBatched(jobs, 15, async (name) => {
@@ -849,12 +829,9 @@ module.exports = {
       );
       const sentMsg = await message.reply({ embeds: [embed], components: [row] });
 
-      // The embed says "confirm within 15 seconds" — actually enforce that instead of leaving
-      // the button clickable forever. If nobody's pressed it by then, disable it and swap the
-      // label so it's visually obvious it's dead, rather than silently still being live weeks later.
       markPending(sentMsg.id);
       setTimeout(async () => {
-        if (!consume(sentMsg.id)) return; // already confirmed (or already expired) — nothing to do
+        if (!consume(sentMsg.id)) return;
         const expiredRow = new ActionRowBuilder().addComponents(
           ButtonBuilder.from(row.components[0]).setDisabled(true).setLabel('Expired').setStyle(ButtonStyle.Secondary)
         );
@@ -869,6 +846,12 @@ module.exports = {
         return message.reply('❌ You need **Administrator** to manage the whitelist.');
       }
       const sub = args[0]?.toLowerCase();
+
+      if (!sub) {
+        const { embed, row } = buildWhitelistPanel(config);
+        return message.reply({ embeds: [embed], components: [row] });
+      }
+
       const target = message.mentions.users.first();
 
       if (sub === 'add') {
@@ -877,26 +860,37 @@ module.exports = {
         if (config.antinuke.whitelist.includes(target.id)) return message.reply(`⚠️ ${target} is already whitelisted.`);
         config.antinuke.whitelist.push(target.id);
         saveGuild(message.guild.id, config);
-        return message.reply(`✅ ${target} added to the anti-nuke whitelist. (${config.antinuke.whitelist.length} total)`);
+        return message.reply(`🟩 : ${target} added to the anti-nuke whitelist. (${config.antinuke.whitelist.length} total)`);
       }
       if (sub === 'remove' || sub === 'rmv') {
         if (!target) return message.reply(`❌ Mention a user: \`${prefix}wl remove @user\``);
         if (!config.antinuke.whitelist.includes(target.id)) return message.reply(`⚠️ ${target} isn't on the whitelist.`);
         config.antinuke.whitelist = config.antinuke.whitelist.filter(id => id !== target.id);
         saveGuild(message.guild.id, config);
-        return message.reply(`🗑️ ${target} removed from the anti-nuke whitelist. (${config.antinuke.whitelist.length} total)`);
+        return message.reply(`🟥 : ${target} removed from the anti-nuke whitelist. (${config.antinuke.whitelist.length} total)`);
       }
       if (sub === 'list') {
         const ids = config.antinuke.whitelist;
-        if (!ids.length) return message.reply('No one whitelisted yet.');
-        const CHUNK = 40;
-        for (let i = 0; i < ids.length; i += CHUNK) {
-          const chunk = ids.slice(i, i + CHUNK);
-          await message.channel.send(chunk.map(id => `<@${id}>`).join('\n'));
-        }
-        return;
+        const embed = new EmbedBuilder()
+          .setTitle('🛡️ Anti-Nuke Whitelist')
+          .setColor(0x5865F2)
+          .setDescription(
+            ids.length
+              ? ids.map(id => `🟩 : <@${id}>`).join('\n')
+              : '🟥 : No one whitelisted yet.'
+          )
+          .setFooter({ text: `Use ${prefix}wl (no arguments) to tick/untick members interactively.` });
+        return message.reply({ embeds: [embed] });
       }
-      return message.reply(`Usage: \`${prefix}wl add|remove|list [@user]\``);
+      return message.reply(`Usage: \`${prefix}wl\` (interactive panel), \`${prefix}wl add|remove|list [@user]\``);
+    }
+
+    if (cmd === 'modules' || cmd === 'antinukemodules' || cmd === 'protections') {
+      if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return message.reply('❌ You need **Administrator** to manage anti-nuke modules.');
+      }
+      const { embed, row } = buildModulesPanel(config);
+      return message.reply({ embeds: [embed], components: [row] });
     }
 
     if (cmd === 'play') {
