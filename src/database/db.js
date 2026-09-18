@@ -54,13 +54,43 @@ function defaultGuildConfig() {
         roleDelete: { count: 3, seconds: 10 },
         roleCreate: { count: 5, seconds: 10 },
         ban: { count: 1, seconds: 10 },
+        // Bug fix: guildBanRemove.js has always called guard(..., 'unban', ...), but this key
+        // never existed here — guard() bails out whenever a threshold lookup misses, so Anti
+        // Unban has been silently doing nothing since it was added.
+        unban: { count: 3, seconds: 10 },
         kick: { count: 1, seconds: 10 },
         webhookCreate: { count: 3, seconds: 15 },
         mentionSpam: { count: 3, seconds: 15 },
-        memberPrune: { count: 1, seconds: 10 }
+        // Bug fix: same issue — messageCreate.js's repeat-message-flood detector has always
+        // reported the 'messageSpam' key, which also never existed here.
+        messageSpam: { count: 4, seconds: 8 },
+        // NOTE: this is enforced by guildMemberRemove.js as "removed >= count in one prune audit
+        // log entry", not "count separate prune actions within the window" like the other
+        // thresholds — a single Discord prune can remove many members at once, so `seconds` is
+        // unused for this one.
+        memberPrune: { count: 10, seconds: 10 }
       },
       allowBotAdd: false,
-      allowDangerousPerms: false
+      allowDangerousPerms: false,
+      // Per-protection on/off switches, shown/edited via `&modules`. Two of these ("botAdd" and
+      // "roleUpdate") are read/written through the legacy allowBotAdd/allowDangerousPerms fields
+      // above instead of living here directly — see antinukeManager.isModuleEnabled/setModuleEnabled,
+      // which is the only place that distinction should matter.
+      modules: {
+        ban: true,
+        unban: true,
+        kick: true,
+        memberPrune: true,
+        botAdd: true,
+        channelCreate: true,
+        channelDelete: true,
+        roleCreate: true,
+        roleDelete: true,
+        roleUpdate: true,
+        webhookCreate: true,
+        mentionSpam: true,
+        messageSpam: true
+      }
     },
     autoresponder: {
       enabled: true,
@@ -90,7 +120,8 @@ function getGuild(guildId) {
   cache[guildId].antinuke = {
     ...def.antinuke,
     ...cache[guildId].antinuke,
-    thresholds: { ...def.antinuke.thresholds, ...(cache[guildId].antinuke?.thresholds || {}) }
+    thresholds: { ...def.antinuke.thresholds, ...(cache[guildId].antinuke?.thresholds || {}) },
+    modules: { ...def.antinuke.modules, ...(cache[guildId].antinuke?.modules || {}) }
   };
   cache[guildId].autoresponder = {
     ...def.autoresponder,
