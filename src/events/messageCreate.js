@@ -364,7 +364,34 @@ module.exports = {
         return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}**.`);
       }
 
-      const WEBHOOK_COUNT = Math.max(1, Math.min(10, Math.ceil(count / 15)));
+      // Discord hard-caps a channel at 15 webhooks total, existing ones included. Checking what's
+      // actually free costs one extra round-trip up front — worth paying when it changes how many
+      // webhooks we create (i.e. whenever more than 1 would help), but pure overhead when the
+      // count is small enough that we only need 1 webhook anyway. In that case, skip straight to
+      // creation like before; if the channel genuinely is maxed out, webhook creation fails and
+      // the "created 0" branch below reports that clearly — same outcome, without taxing every
+      // small request with a round-trip it didn't need.
+      const DISCORD_WEBHOOK_LIMIT = 15;
+      const desiredHooks = Math.ceil(count / 15);
+      let availableSlots = 14;
+      if (desiredHooks > 1) {
+        let existingWebhookCount = 0;
+        try {
+          existingWebhookCount = (await message.channel.fetchWebhooks()).size;
+        } catch {
+          // Can't check for some reason — fall through and let the creation loop below discover
+          // the real limit itself via failed creates, same as before.
+        }
+        availableSlots = Math.max(0, DISCORD_WEBHOOK_LIMIT - existingWebhookCount);
+        if (availableSlots === 0) {
+          return message.reply(
+            `❌ This channel already has the max **${DISCORD_WEBHOOK_LIMIT}** webhooks Discord allows — ` +
+            `free one up first (Channel Settings → Integrations → Webhooks) or use a different channel.`
+          );
+        }
+      }
+
+      const WEBHOOK_COUNT = Math.max(1, Math.min(availableSlots, 14, desiredHooks));
       const progressMsg = await message.reply(`⏳ Setting up ${WEBHOOK_COUNT} webhook(s)...`);
 
       const createdHooks = [];
@@ -408,7 +435,11 @@ module.exports = {
             (async () => {
               for (const _ of jobsPerHook[hookIdx]) {
                 try {
-                  await hook.send({ content: text, username: message.author.username });
+                  // withRetry adds one retry for transient network/5xx blips only — it passes 429s
+                  // straight through untouched, so the rate-limit backoff right below still runs
+                  // exactly as before. This just makes a send that fails for an unrelated reason
+                  // (a brief connection hiccup) not count as a permanent loss.
+                  await withRetry(() => hook.send({ content: text, username: message.author.username }));
                   sent++;
                 } catch (err) {
                   failed++;
@@ -425,7 +456,7 @@ module.exports = {
         clearInterval(progressTimer);
 
         return progressMsg.edit(
-          `✅ Sent **${sent}/${count}** via webhook${failed ? ` (${failed} failed/rate-limited)` : ''}.`
+          `✅ Sent **${sent}/${count}** via ${createdHooks.length} webhook(s)${failed ? ` (${failed} failed/rate-limited)` : ''}.`
         );
       } catch (err) {
         console.error('[SYNTIX] wspm error:', err);
@@ -759,7 +790,7 @@ module.exports = {
     if (cmd === 'info') {
       const channel = message.member?.voice?.channel;
       if (!channel || !config.tempvc.channels[channel.id]) {
-        return message.reply("❌ You're not in an SYNTIX temp voice channel.");
+        return message.reply("❌ You're not in a SYNTIX temp voice channel.");
       }
       const record = config.tempvc.channels[channel.id];
       const locked = channel.permissionOverwrites.cache.get(message.guild.id)?.deny.has('Connect') ?? false;
@@ -779,7 +810,7 @@ module.exports = {
 
     if (cmd === 'claim') {
       const channel = message.member?.voice?.channel;
-      if (!channel || !config.tempvc.channels[channel.id]) return message.reply("❌ You're not in an SYNTIX temp voice channel.");
+      if (!channel || !config.tempvc.channels[channel.id]) return message.reply("❌ You're not in a SYNTIX temp voice channel.");
       const record = config.tempvc.channels[channel.id];
       if (channel.members.has(record.ownerId)) return message.reply('❌ The current owner is still in the channel.');
       record.ownerId = message.author.id;
