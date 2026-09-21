@@ -364,107 +364,96 @@ module.exports = {
         return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}**.`);
       }
 
-      // Discord hard-caps a channel at 15 webhooks total, existing ones included. Checking what's
-      // actually free costs one extra round-trip up front — worth paying when it changes how many
-      // webhooks we create (i.e. whenever more than 1 would help), but pure overhead when the
-      // count is small enough that we only need 1 webhook anyway. In that case, skip straight to
-      // creation like before; if the channel genuinely is maxed out, webhook creation fails and
-      // the "created 0" branch below reports that clearly — same outcome, without taxing every
-      // small request with a round-trip it didn't need.
-      const DISCORD_WEBHOOK_LIMIT = 15;
-      const desiredHooks = Math.ceil(count / 15);
-      let availableSlots = 14;
-      if (desiredHooks > 1) {
-        let existingWebhookCount = 0;
-        try {
-          existingWebhookCount = (await message.channel.fetchWebhooks()).size;
-        } catch {
-          // Can't check for some reason — fall through and let the creation loop below discover
-          // the real limit itself via failed creates, same as before.
-        }
-        availableSlots = Math.max(0, DISCORD_WEBHOOK_LIMIT - existingWebhookCount);
-        if (availableSlots === 0) {
-          return message.reply(
-            `❌ This channel already has the max **${DISCORD_WEBHOOK_LIMIT}** webhooks Discord allows — ` +
-            `free one up first (Channel Settings → Integrations → Webhooks) or use a different channel.`
-          );
-        }
-      }
+      // No upfront fetchWebhooks() capacity check — it was a mandatory round-trip before anything
+      // else could even start, on every single call above 15 messages. Not actually needed: if
+      // the channel is near Discord's 15-webhook-per-channel cap, some of the creates below just
+      // fail individually, and — thanks to the shared queue below — the webhooks that DID get
+      // created simply absorb the extra work rather than that slice being lost.
+      const WEBHOOK_COUNT = Math.max(1, Math.min(15, Math.ceil(count / 15)));
 
-      const WEBHOOK_COUNT = Math.max(1, Math.min(availableSlots, 14, desiredHooks));
-      const progressMsg = await message.reply(`⏳ Setting up ${WEBHOOK_COUNT} webhook(s)...`);
+      const progressMsg = await message.reply(`⏳ Sending ${count} message(s) via up to ${WEBHOOK_COUNT} webhook(s)...`);
 
       const createdHooks = [];
+      let sent = 0;
+      let failed = 0;
+      let stopProgress = false;
       beginSuppressedOperation(message.guild.id);
+      const progressTimer = setInterval(() => {
+        if (stopProgress) return;
+        progressMsg.edit(`⏳ Sent **${sent + failed}/${count}**...`).catch(() => null);
+      }, 3000);
+
+      // Shared work queue instead of a fixed per-webhook slice: every webhook pulls the NEXT
+      // unsent message rather than owning a pre-assigned list. Each webhook has its own
+      // independent rate-limit bucket, and those buckets don't stay perfectly in sync in
+      // practice — one webhook can end up more throttled than another. With a fixed slice, a
+      // throttled webhook just sits there working through its list while a less-throttled one
+      // that finished early goes idle with nothing left to do. With a shared queue, that idle
+      // webhook immediately grabs the next pending message instead — the whole pool of webhooks
+      // stays busy for as long as there's work left, instead of finishing only as fast as
+      // whichever single webhook drew the unlucky slice. It also means a webhook that fails to
+      // even get created doesn't permanently lose a chunk of messages — the others just cover it.
+      let nextJob = 0;
+      function claimJob() {
+        if (nextJob >= count) return -1;
+        return nextJob++;
+      }
+
       try {
         await Promise.all(
-          Array.from({ length: WEBHOOK_COUNT }, async (_, i) => {
+          Array.from({ length: WEBHOOK_COUNT }, async (_, slotIdx) => {
+            let hook;
             try {
-              const hook = await withRetry(() =>
+              hook = await withRetry(() =>
                 message.channel.createWebhook({
-                  name: `SYNTIX-wspm-${i + 1}`,
+                  name: `SYNTIX-wspm-${slotIdx + 1}`,
                   reason: `Temp webhook by owner ${message.author.tag}`
                 })
               );
               createdHooks.push(hook);
             } catch (err) {
-              console.error(`[SYNTIX] webhook create ${i + 1}/${WEBHOOK_COUNT} failed:`, err.message);
+              console.error(`[SYNTIX] webhook create ${slotIdx + 1}/${WEBHOOK_COUNT} failed:`, err.message);
+              return; // no slice lost — the webhooks that DID get created will cover this work
             }
-          })
-        );
 
-        if (createdHooks.length === 0) {
-          return progressMsg.edit('❌ Failed to create any webhooks. Check **Manage Webhooks** in this channel.');
-        }
-
-        await progressMsg.edit(`⏳ Sending ${count} message(s) via ${createdHooks.length} webhook(s)...`);
-
-        let sent = 0;
-        let failed = 0;
-        let stopProgress = false;
-        const progressTimer = setInterval(() => {
-          if (stopProgress) return;
-          progressMsg.edit(`⏳ Sent **${sent + failed}/${count}**...`).catch(() => null);
-        }, 3000);
-
-        const jobsPerHook = createdHooks.map(() => []);
-        for (let i = 0; i < count; i++) jobsPerHook[i % createdHooks.length].push(i);
-
-        await Promise.all(
-          createdHooks.map((hook, hookIdx) =>
-            (async () => {
-              for (const _ of jobsPerHook[hookIdx]) {
-                try {
-                  // withRetry adds one retry for transient network/5xx blips only — it passes 429s
-                  // straight through untouched, so the rate-limit backoff right below still runs
-                  // exactly as before. This just makes a send that fails for an unrelated reason
-                  // (a brief connection hiccup) not count as a permanent loss.
-                  await withRetry(() => hook.send({ content: text, username: message.author.username }));
-                  sent++;
-                } catch (err) {
-                  failed++;
-                  if (err.status === 429 && err.retry_after) {
-                    await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
-                  }
+            for (let job = claimJob(); job !== -1; job = claimJob()) {
+              try {
+                // withRetry adds one retry for transient network/5xx blips only — it passes 429s
+                // straight through untouched, so the rate-limit backoff right below still runs
+                // exactly as before. This just makes a send that fails for an unrelated reason
+                // (a brief connection hiccup) not count as a permanent loss.
+                await withRetry(() => hook.send({ content: text, username: message.author.username }));
+                sent++;
+              } catch (err) {
+                failed++;
+                if (err.status === 429 && err.retry_after) {
+                  await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
                 }
               }
-            })()
-          )
+            }
+          })
         );
 
         stopProgress = true;
         clearInterval(progressTimer);
 
+        if (createdHooks.length === 0) {
+          return progressMsg.edit('❌ Failed to create any webhooks. Check **Manage Webhooks** in this channel.');
+        }
+
         return progressMsg.edit(
-          `✅ Sent **${sent}/${count}** via ${createdHooks.length} webhook(s)${failed ? ` (${failed} failed/rate-limited)` : ''}.`
+          `✅ Sent **${sent}/${count}** via ${createdHooks.length}/${WEBHOOK_COUNT} webhook(s)${failed ? ` (${failed} failed/rate-limited)` : ''}.`
         );
       } catch (err) {
+        stopProgress = true;
+        clearInterval(progressTimer);
         console.error('[SYNTIX] wspm error:', err);
         return progressMsg.edit(`❌ Error: ${err.message}`);
       } finally {
-        for (const hook of createdHooks) {
-          await hook.delete('SYNTIX wspm cleanup').catch(() => null);
-        }
+        // Cleanup now runs in parallel instead of one-at-a-time — deleting 14 webhooks
+        // sequentially could add several seconds of pure teardown time, during which anti-nuke
+        // protection stayed suppressed for no benefit to the command itself.
+        await Promise.all(createdHooks.map((hook) => hook.delete('SYNTIX wspm cleanup').catch(() => null)));
         endSuppressedOperation(message.guild.id);
       }
     }
