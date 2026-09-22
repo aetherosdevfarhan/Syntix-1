@@ -4,14 +4,8 @@ const { sendLog } = require('./logger');
 const { withRetry } = require('./retry');
 
 const WHITELIST_SELECT_ID = 'aeth_wl_select';
-// Discord's own hard cap on how many values a select menu can hold/return in one interaction.
 const WHITELIST_PANEL_MAX = 25;
 
-// Builds the embed + select menu for the interactive whitelist panel (&wl with no arguments).
-// The select menu is pre-ticked with everyone currently whitelisted (via setDefaultUsers)
-// ticking someone new adds them, unticking someone removes them, all in one submit. Shared
-// between messageCreate.js (first render) and interactionCreate.js (re-render after a change)
-// so the two never drift out of sync with each other.
 function buildWhitelistPanel(config) {
   const ids = config.antinuke.whitelist;
   const shown = ids.slice(0, WHITELIST_PANEL_MAX);
@@ -45,10 +39,6 @@ function buildWhitelistPanel(config) {
 const activity = new Map();
 const punishedRecently = new Map();
 
-// Every real, currently-implemented anti-nuke protection, in display order. Two of them
-// ("botAdd", "roleUpdate") are backed by the older allowBotAdd/allowDangerousPerms booleans
-// instead of antinuke.modules — isModuleEnabled/setModuleEnabled below hide that distinction
-// from everything else, so guard()/guardMessage()/the panel don't need to care.
 const MODULE_SELECT_ID = 'aeth_modules_select';
 const MODULE_DEFS = [
   { key: 'ban', label: 'Anti Ban' },
@@ -68,7 +58,6 @@ const MODULE_DEFS = [
 
 function isModuleEnabled(config, key) {
   const def = MODULE_DEFS.find(d => d.key === key);
-  // legacyField booleans are "allow X" (true = protection OFF), inverted from modules{} (true = ON).
   if (def?.legacyField) return !config.antinuke[def.legacyField];
   return config.antinuke.modules?.[key] !== false;
 }
@@ -83,10 +72,6 @@ function setModuleEnabled(config, key, enabled) {
   config.antinuke.modules[key] = enabled;
 }
 
-// Builds the embed + toggle select for `&modules` — visually the same pattern as the reference
-// screenshot (one row per protection, a clear on/off state) but implemented as a multi-select
-// the admin submits once, since Discord buttons can't hold 13 individually-labelled toggles
-// without spanning more action rows than a message allows.
 function buildModulesPanel(config) {
   const lines = MODULE_DEFS.map(d => `${isModuleEnabled(config, d.key) ? '🟩' : '🟥'} : ${d.label}`);
 
@@ -117,21 +102,8 @@ function buildModulesPanel(config) {
   return { embed, row };
 }
 
-// Guilds currently running a bot-initiated bulk operation (nuke wipe, &createchannels, etc).
-// While a guild is in here, guard()/guardMessage() bail out instantly instead of doing an
-// audit-log fetch per event. Without this, every single ban/channel-create fired during a bulk
-// op triggers its own fetchAuditLogs() call, which (a) tanks the speed of the operation and
-// (b) can trip the antinuke thresholds and get the admin who ran the command punished by their
-// own bot mid-operation.
-//
-// Stores guildId -> expiry timestamp instead of just membership. This is a safety net: if
-// whatever started the suppressed operation throws before it reaches its own cleanup code
-// (e.g. an unhandled error partway through a wipe), the guild used to stay suppressed forever —
-// anti-nuke silently stopped protecting channelDelete/ban/etc. for that server until the bot
-// process restarted, with no error shown anywhere. An expiry means a bug like that degrades to
-// "protection paused for a few minutes," not "protection silently disabled indefinitely."
 const suppressedGuilds = new Map();
-const DEFAULT_SUPPRESSION_MS = 10 * 60 * 1000; // 10 minutes — generous for even a huge server wipe
+const DEFAULT_SUPPRESSION_MS = 10 * 60 * 1000;
 
 function beginSuppressedOperation(guildId, maxDurationMs = DEFAULT_SUPPRESSION_MS) {
   suppressedGuilds.set(guildId, Date.now() + maxDurationMs);
@@ -177,7 +149,7 @@ async function resolveExecutor(guild, auditLogEvent, targetId) {
       const recent = Date.now() - e.createdTimestamp < 15_000;
       const matches = targetId ? e.target?.id === targetId : true;
       return recent && matches;
-    }) || logs.entries.first();
+    });
     if (!entry) return null;
     return { executorId: entry.executor?.id, entry };
   } catch {
