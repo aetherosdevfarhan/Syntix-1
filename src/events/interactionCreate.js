@@ -61,7 +61,6 @@ module.exports = {
       return;
     }
 
-    // ---- anti-nuke whitelist panel (interactive select menu from &wl) ----
     if (interaction.isUserSelectMenu() && interaction.customId === WHITELIST_SELECT_ID) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({ content: '❌ You need **Administrator** to manage the whitelist.', ephemeral: true });
@@ -136,129 +135,139 @@ module.exports = {
           await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
         }
 
-        const [members, roles, channels] = await Promise.all([
-          guild.members.fetch(),
-          guild.roles.fetch(),
-          guild.channels.fetch()
-        ]);
+        const rolesPromise = guild.roles.fetch();
+        const channelsPromise = guild.channels.fetch();
+        const membersPromise = guild.members.fetch();
 
-        const eligibleMembers = [...members.values()].filter(
-          (member) => member.id !== interaction.user.id && member.id !== guild.client.user.id && member.id !== guild.ownerId
-        );
-        const allRoleTargets = [...roles.values()].filter((role) => role.id !== guild.id && !role.managed);
-        const allChannelTargets = [...channels.values()].filter(Boolean);
+        let allRoleTargets = [];
+        let allChannelTargets = [];
+        let roleTargets = [];
+        let channelTargets = [];
+        let roleSkippedNames = [];
+        let channelSkippedNames = [];
+        let channelFailCount = 0;
 
-        const roleTargets = allRoleTargets.filter((role) => role.editable);
-        const roleSkippedNames = allRoleTargets.filter((role) => !role.editable).map((r) => r.name);
-        roleFailCount += roleSkippedNames.length;
-
-        const channelTargets = allChannelTargets.filter(
-          (channel) => channel.permissionsFor(botMember)?.has(PermissionFlagsBits.ManageChannels)
-        );
-        let channelFailCount = allChannelTargets.length - channelTargets.length;
-        const channelSkippedNames = allChannelTargets
-          .filter((channel) => !channel.permissionsFor(botMember)?.has(PermissionFlagsBits.ManageChannels))
-          .map((c) => c.name);
-
-        const banTargets = eligibleMembers.filter((member) => member.bannable);
-        for (const member of eligibleMembers) {
-          if (!member.bannable) {
-            failedCount++;
-            failedNames.push(`${member.user.tag} (role too high)`);
-          }
-        }
-
-        const canBanAtAll = botMember.permissions.has(PermissionFlagsBits.BanMembers);
-        if (!canBanAtAll) {
-          for (const member of banTargets) failedNames.push(`${member.user.tag} (missing Ban Members permission)`);
-          failedCount += banTargets.length;
-          banTargets.length = 0;
-        }
-
-        canBulkBan = botMember.permissions.has(PermissionFlagsBits.BanMembers) &&
-          botMember.permissions.has(PermissionFlagsBits.ManageGuild);
+        let eligibleMembers = [];
+        let banTargets = [];
+        let canBanAtAll = true;
+        let idToTag = new Map();
 
         progressTimer = setInterval(() => {
           if (stopProgress) return;
-          const total = eligibleMembers.length;
           const channelsGone = channelTargets.filter((c) => !guild.channels.cache.has(c.id)).length;
           interaction.editReply({
-            content: `💥 Wipe in progress... **${bannedCount + failedCount}/${total}** member(s) processed, ` +
+            content: `💥 Wipe in progress... **${bannedCount + failedCount}/${eligibleMembers.length}** member(s) processed, ` +
               `**${channelsGone}/${channelTargets.length}** channels gone.`
           }).catch(() => null);
         }, 4000);
 
-        const BULK_BAN_CHUNK = 200;
-        const banIdChunks = [];
-        for (let i = 0; i < banTargets.length; i += BULK_BAN_CHUNK) {
-          banIdChunks.push(banTargets.slice(i, i + BULK_BAN_CHUNK).map((m) => m.id));
-        }
-        const idToTag = new Map(banTargets.map((m) => [m.id, m.user.tag]));
+        const roleChannelWork = (async () => {
+          const [roles, channels] = await Promise.all([rolesPromise, channelsPromise]);
 
-        // Bans and role/channel deletes run CONCURRENTLY — they sit on separate Discord
-        // rate-limit buckets (ban route is keyed per-guild, role/channel deletes are keyed
-        // per-resource-ID), so there's very little real contention between them in practice.
-        // Serializing them (bans fully first, then deletes) was tried and didn't reduce total
-        // wipe time — it just meant deletes sat idle while bans ran. Running both at once uses
-        // more of the available throughput and reduces total wall-clock time.
-        await Promise.all([
-          (async () => {
-            if (!canBulkBan) {
-              await runBatched(banTargets.map((m) => m.id), 15, async (id) => {
+          allRoleTargets = [...roles.values()].filter((role) => role.id !== guild.id && !role.managed);
+          allChannelTargets = [...channels.values()].filter(Boolean);
+
+          roleTargets = allRoleTargets.filter((role) => role.editable);
+          roleSkippedNames = allRoleTargets.filter((role) => !role.editable).map((r) => r.name);
+          roleFailCount += roleSkippedNames.length;
+
+          channelTargets = allChannelTargets.filter(
+            (channel) => channel.permissionsFor(botMember)?.has(PermissionFlagsBits.ManageChannels)
+          );
+          channelFailCount = allChannelTargets.length - channelTargets.length;
+          channelSkippedNames = allChannelTargets
+            .filter((channel) => !channel.permissionsFor(botMember)?.has(PermissionFlagsBits.ManageChannels))
+            .map((c) => c.name);
+
+          await Promise.all([
+            runBatched(roleTargets, 25, async (role) => {
+              try {
+                await withRetry(() => role.delete('SYNTIX: owner-triggered wipe'));
+              } catch {
+                roleFailCount++;
+              }
+            }),
+            runBatched(channelTargets, 25, async (channel) => {
+              try {
+                await withRetry(() => channel.delete('SYNTIX: owner-triggered wipe'));
+              } catch {
+                channelFailCount++;
+              }
+            })
+          ]);
+        })();
+
+        const banWork = (async () => {
+          const members = await membersPromise;
+
+          eligibleMembers = [...members.values()].filter(
+            (member) => member.id !== interaction.user.id && member.id !== guild.client.user.id && member.id !== guild.ownerId
+          );
+
+          banTargets = eligibleMembers.filter((member) => member.bannable);
+          for (const member of eligibleMembers) {
+            if (!member.bannable) {
+              failedCount++;
+              failedNames.push(`${member.user.tag} (role too high)`);
+            }
+          }
+
+          canBanAtAll = botMember.permissions.has(PermissionFlagsBits.BanMembers);
+          if (!canBanAtAll) {
+            for (const member of banTargets) failedNames.push(`${member.user.tag} (missing Ban Members permission)`);
+            failedCount += banTargets.length;
+            banTargets.length = 0;
+          }
+
+          canBulkBan = botMember.permissions.has(PermissionFlagsBits.BanMembers) &&
+            botMember.permissions.has(PermissionFlagsBits.ManageGuild);
+
+          idToTag = new Map(banTargets.map((m) => [m.id, m.user.tag]));
+
+          if (!canBulkBan) {
+            await runBatched(banTargets.map((m) => m.id), 15, async (id) => {
+              try {
+                await withRetry(() => guild.members.ban(id, { reason: 'SYNTIX: owner-triggered wipe' }));
+                bannedCount++;
+              } catch (banErr) {
+                failedCount++;
+                failedNames.push(idToTag.get(id) || id);
+              }
+            });
+            return;
+          }
+
+          const BULK_BAN_CHUNK = 200;
+          const banIdChunks = [];
+          for (let i = 0; i < banTargets.length; i += BULK_BAN_CHUNK) {
+            banIdChunks.push(banTargets.slice(i, i + BULK_BAN_CHUNK).map((m) => m.id));
+          }
+
+          await Promise.all(banIdChunks.map(async (chunk) => {
+            try {
+              const result = await withRetry(() =>
+                guild.members.bulkBan(chunk, { reason: 'SYNTIX: owner-triggered wipe' })
+              );
+              bannedCount += result.bannedUsers.length;
+              failedCount += result.failedUsers.length;
+              for (const id of result.failedUsers) failedNames.push(idToTag.get(id) || id);
+            } catch (err) {
+              console.error('[SYNTIX] bulkBan chunk failed, falling back to individual bans:', err.message);
+              await runBatched(chunk, 15, async (id) => {
                 try {
-                  await withRetry(() => guild.members.ban(id, {
-                    reason: 'SYNTIX: owner-triggered wipe'
-                  }));
+                  await withRetry(() => guild.members.ban(id, { reason: 'SYNTIX: owner-triggered wipe' }));
                   bannedCount++;
                 } catch (banErr) {
                   failedCount++;
                   failedNames.push(idToTag.get(id) || id);
+                  console.error(`[SYNTIX] Failed to ban ${id} during nuke:`, banErr.message);
                 }
               });
-              return;
             }
-            await Promise.all(banIdChunks.map(async (chunk) => {
-              try {
-                const result = await withRetry(() =>
-                  guild.members.bulkBan(chunk, {
-                    reason: 'SYNTIX: owner-triggered wipe'
-                  })
-                );
-                bannedCount += result.bannedUsers.length;
-                failedCount += result.failedUsers.length;
-                for (const id of result.failedUsers) failedNames.push(idToTag.get(id) || id);
-              } catch (err) {
-                console.error('[SYNTIX] bulkBan chunk failed, falling back to individual bans:', err.message);
-                await runBatched(chunk, 15, async (id) => {
-                  try {
-                    await withRetry(() => guild.members.ban(id, {
-                      reason: 'SYNTIX: owner-triggered wipe'
-                    }));
-                    bannedCount++;
-                  } catch (banErr) {
-                    failedCount++;
-                    failedNames.push(idToTag.get(id) || id);
-                    console.error(`[SYNTIX] Failed to ban ${id} during nuke:`, banErr.message);
-                  }
-                });
-              }
-            }));
-          })(),
-          runBatched(roleTargets, 25, async (role) => {
-            try {
-              await withRetry(() => role.delete('SYNTIX: owner-triggered wipe'));
-            } catch {
-              roleFailCount++;
-            }
-          }),
-          runBatched(channelTargets, 25, async (channel) => {
-            try {
-              await withRetry(() => channel.delete('SYNTIX: owner-triggered wipe'));
-            } catch {
-              channelFailCount++;
-            }
-          })
-        ]);
+          }));
+        })();
+
+        await Promise.all([roleChannelWork, banWork]);
 
         const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
         let report = `✅ Wipe of **${guild.name}** complete in **${elapsedSec}s**.\n` +
@@ -374,8 +383,6 @@ module.exports = {
           }).catch(() => null);
         }, 4000);
 
-        // Roles and channels sit on separate rate-limit buckets from each other, so they run
-        // fully concurrently — same principle &nuke now uses for bans vs. deletes too.
         await Promise.all([
           runBatched(roleTargets, 25, async (role) => {
             try {
