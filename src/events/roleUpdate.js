@@ -21,7 +21,7 @@ module.exports = {
     if (isImmune(newRole.guild, config, member)) return;
 
     try {
-      await newRole.setPermissions(oldRole.permissions, 'AETHEROS Anti-Nuke: reverted dangerous permission grant');
+      await newRole.setPermissions(oldRole.permissions, 'SYNTIX Anti-Nuke: reverted dangerous permission grant');
     } catch { /* missing perms to fix the role */ }
 
     await sendLog(newRole.guild, config, {
