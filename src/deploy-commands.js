@@ -6,7 +6,17 @@ const { REST, Routes } = require('discord.js');
 const commands = [];
 const commandsDir = path.join(__dirname, 'commands');
 for (const file of fs.readdirSync(commandsDir).filter(f => f.endsWith('.js'))) {
-  const command = require(path.join(commandsDir, file));
+  let command;
+  try {
+    command = require(path.join(commandsDir, file));
+  } catch (err) {
+    // A single broken command file (e.g. a missing/native dependency like @discordjs/voice or
+    // play-dl failing to install on this host) used to crash this whole script before it ever
+    // reached the try/catch below. Since `npm start` runs this with `&&` before src/index.js,
+    // that crash silently prevented the bot — and its dummy HTTP server — from starting at all.
+    console.error(`[SYNTIX] Failed to load command "${file}" — skipping it for deploy:`, err.message);
+    continue;
+  }
   if (command?.data) commands.push(command.data.toJSON());
 }
 
