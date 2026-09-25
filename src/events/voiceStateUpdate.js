@@ -14,7 +14,7 @@ module.exports = {
         try {
           await handleJoinCreate(newState.member, newState.channel);
         } catch (err) {
-          console.error('[AETHEROS] Failed to create temp voice channel:', err);
+          console.error('[SYNTIX] Failed to create temp voice channel:', err);
         }
       }
     }
