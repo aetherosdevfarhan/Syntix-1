@@ -6,7 +6,19 @@ const { markPending, consume } = require('../utils/pendingConfirms');
 const music = require('../utils/musicManager');
 const { matchAutoResponse, findAutoReactEmojis, normalize } = require('../utils/autoEngage');
 
+// Stores { content, ts } per "guildId:authorId" so the repeat-message-spam check below has
+// something to compare against. Previously this map only ever grew (one entry per user who'd
+// ever spoken, forever) — on a long-running process that's a slow memory leak. Now each entry
+// carries a timestamp and a periodic sweep drops anything stale, so idle users' entries don't
+// stick around forever.
 const lastMessageByAuthor = new Map();
+const LAST_MESSAGE_TTL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of lastMessageByAuthor) {
+    if (now - entry.ts > LAST_MESSAGE_TTL_MS) lastMessageByAuthor.delete(key);
+  }
+}, LAST_MESSAGE_TTL_MS).unref();
 
 function ownedChannelOf(message, config) {
   const channel = message.member?.voice?.channel;
@@ -74,7 +86,8 @@ module.exports = {
     if (message.content && message.member) {
       const key = `${message.guild.id}:${message.author.id}`;
       const normalized = message.content.trim().toLowerCase();
-      if (normalized && lastMessageByAuthor.get(key) === normalized) {
+      const previous = lastMessageByAuthor.get(key);
+      if (normalized && previous?.content === normalized) {
         await guardMessage(
           message.guild,
           message.member,
@@ -82,7 +95,7 @@ module.exports = {
           'Repeated message spam detected'
         ).catch(() => null);
       }
-      lastMessageByAuthor.set(key, normalized);
+      lastMessageByAuthor.set(key, { content: normalized, ts: Date.now() });
     }
 
     const prefix = config.prefix || '&';
