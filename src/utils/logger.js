@@ -17,7 +17,7 @@ async function sendLog(guild, guildConfig, { title, description, color = 'info',
     .setDescription(description || null)
     .setColor(COLORS[color] ?? COLORS.info)
     .setTimestamp()
-    .setFooter({ text: 'AETHEROS · Anti-Nuke' });
+    .setFooter({ text: 'SYNTIX · Anti-Nuke' });
 
   if (fields.length) embed.addFields(fields);
 
