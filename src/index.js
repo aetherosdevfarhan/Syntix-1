@@ -37,6 +37,14 @@ client.login(token).catch((err) => {
 
 const http = require('node:http');
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => res.end('SYNTIX is running')).listen(PORT, () => {
+const healthServer = http.createServer((req, res) => res.end('SYNTIX is running'));
+healthServer.on('error', (err) => {
+  // Without this handler, a bind failure (most commonly EADDRINUSE — something already using
+  // this PORT, e.g. another SYNTIX process still running in a previous Termux session) throws
+  // as an unhandled 'error' event, which crashes the whole process. This just logs it instead,
+  // so a health-check port clash can't silently take the Discord bot down with it.
+  console.error(`[SYNTIX] Dummy web server failed to start on port ${PORT}:`, err.message);
+});
+healthServer.listen(PORT, () => {
   console.log(`[SYNTIX] Dummy web server listening on port ${PORT} (for host health checks)`);
 });
