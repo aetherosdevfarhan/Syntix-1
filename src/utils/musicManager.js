@@ -1,30 +1,65 @@
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState,
-  StreamType
-} = require('@discordjs/voice');
-const playdl = require('play-dl');
+let joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, StreamType;
+let playdl;
+let voiceUnavailableReason = null;
 
-// ffmpeg-static gives us a bundled ffmpeg binary so we don't depend on the host having one installed.
+// Missing/broken voice dependencies (very common on Termux/Android — @discordjs/voice's native
+// dependencies frequently fail to compile there without the right toolchain installed) must
+// disable ONLY the music feature, never crash this whole module. Before this fix, a failed
+// require() here threw at load time, which took down every file that requires musicManager.js —
+// including messageCreate.js and music.js — silently disabling EVERY command in the bot, not
+// just music ones. Now the failure is caught, logged once, and every exported function below
+// throws a clear, catchable error instead, so the rest of the bot works normally regardless.
 try {
-  const ffmpegPath = require('ffmpeg-static');
-  process.env.FFMPEG_PATH = ffmpegPath;
-} catch {
-  // ffmpeg-static not installed — playback will fail with a clear error from @discordjs/voice.
+  ({
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
+    entersState,
+    StreamType
+  } = require('@discordjs/voice'));
+  playdl = require('play-dl');
+} catch (err) {
+  voiceUnavailableReason =
+    `Music is unavailable — ${err.message}. Run "npm install" again and check the output for errors. ` +
+    `On Termux specifically, @discordjs/voice's dependencies sometimes need extra packages before ` +
+    `they'll install: try "pkg install nodejs python make clang" then "npm install" again.`;
+  console.error(
+    '[SYNTIX] [music] Voice/music dependencies failed to load — music commands will return a ' +
+    'friendly error, but the rest of the bot is unaffected:',
+    err.message
+  );
+}
+
+function assertVoiceAvailable() {
+  if (voiceUnavailableReason) throw new Error(voiceUnavailableReason);
+}
+
+// ffmpeg-static gives us a bundled ffmpeg binary so we don't depend on the host having one
+// installed — but only when FFMPEG_PATH isn't already set. This matters a lot on Termux: that
+// package downloads a generic prebuilt Linux ELF binary, and Termux is NOT a standard Linux
+// filesystem (no /lib, no FHS, its own dynamic linker path under
+// /data/data/com.termux/files/usr) — so that binary fails to execute there even though the file
+// exists. On Termux, run `pkg install ffmpeg` and `export FFMPEG_PATH=$(which ffmpeg)` before
+// starting the bot; this check makes sure that value is respected instead of being overwritten.
+if (!process.env.FFMPEG_PATH) {
+  try {
+    const ffmpegPath = require('ffmpeg-static');
+    process.env.FFMPEG_PATH = ffmpegPath;
+  } catch {
+    // ffmpeg-static not installed — playback will fail with a clear error from @discordjs/voice.
+  }
 }
 
 // Optional: a logged-in YouTube cookie makes play-dl noticeably more reliable on cloud hosts
 // (Render/Railway/etc. IPs get rate-limited/blocked by YouTube more aggressively than home IPs).
 // This does NOT make it bulletproof — YouTube can still block cloud IPs outright — but it helps.
 // Set YOUTUBE_COOKIE in your host's environment variables to enable it. Leave unset to skip.
-if (process.env.YOUTUBE_COOKIE) {
+if (!voiceUnavailableReason && process.env.YOUTUBE_COOKIE) {
   playdl.setToken({ youtube: { cookie: process.env.YOUTUBE_COOKIE } })
-    .then(() => console.log('[AETHEROS] [music] YouTube cookie loaded.'))
-    .catch(err => console.warn('[AETHEROS] [music] Failed to apply YouTube cookie:', err.message));
+    .then(() => console.log('[SYNTIX] [music] YouTube cookie loaded.'))
+    .catch(err => console.warn('[SYNTIX] [music] Failed to apply YouTube cookie:', err.message));
 }
 
 function friendlyStreamError(err) {
@@ -218,6 +253,7 @@ async function getOrCreateQueue(guild, voiceChannel, textChannel) {
 }
 
 async function addToQueue({ guild, member, textChannel, query }) {
+  assertVoiceAvailable();
   const voiceChannel = member.voice?.channel;
   if (!voiceChannel) throw new Error('Join a voice channel first.');
   if (!voiceChannel.joinable) throw new Error("I don't have permission to join that voice channel.");
