@@ -6,7 +6,7 @@ function requireOwnedChannel(interaction) {
   const config = getGuild(interaction.guild.id);
   const channel = interaction.member.voice.channel;
   if (!channel || !config.tempvc.channels[channel.id]) {
-    return { error: "You're not in a temp voice channel managed by AETHEROS." };
+    return { error: "You're not in a temp voice channel managed by SYNTIX." };
   }
   const record = config.tempvc.channels[channel.id];
   if (record.ownerId !== interaction.user.id) {
@@ -36,7 +36,7 @@ module.exports = {
       const config = getGuild(interaction.guild.id);
       const channel = interaction.member.voice.channel;
       if (!channel || !config.tempvc.channels[channel.id]) {
-        return interaction.reply({ content: "You're not in an AETHEROS temp voice channel.", ephemeral: true });
+        return interaction.reply({ content: "You're not in an SYNTIX temp voice channel.", ephemeral: true });
       }
       const record = config.tempvc.channels[channel.id];
       const ownerStillIn = channel.members.has(record.ownerId);
