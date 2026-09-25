@@ -64,7 +64,7 @@ function buildPanelEmbed(channel, ownerId) {
       `Only the owner (or a claimant, if the owner leaves) can use these controls.`
     )
     .setColor(0x5865F2)
-    .setFooter({ text: 'AETHEROS · Temp Voice' });
+    .setFooter({ text: 'SYNTIX · Temp Voice' });
 }
 
 async function handleJoinCreate(member, joinChannel) {
@@ -139,7 +139,7 @@ async function handleAutoDelete(guild, channel) {
       const msg = pc && (await pc.messages.fetch(record.panelMessageId).catch(() => null));
       if (msg) await msg.delete().catch(() => null);
     }
-    await channel.delete('AETHEROS: temp voice channel empty');
+    await channel.delete('SYNTIX: temp voice channel empty');
   } catch { /* already gone */ }
 
   delete tvc.channels[channel.id];
