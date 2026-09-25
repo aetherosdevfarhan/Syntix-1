@@ -18,7 +18,7 @@ module.exports = {
     if (isImmune(member.guild, config, executorMember)) return;
 
     try {
-      if (member.kickable) await member.kick('AETHEROS Anti-Nuke: unauthorized bot addition');
+      if (member.kickable) await member.kick('SYNTIX Anti-Nuke: unauthorized bot addition');
     } catch { /* missing perms */ }
 
     await sendLog(member.guild, config, {
