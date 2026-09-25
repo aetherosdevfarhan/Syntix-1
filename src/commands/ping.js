@@ -3,7 +3,7 @@ const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('ping')
-    .setDescription('Check if AETHEROS is online and responsive.'),
+    .setDescription('Check if SYNTIX is online and responsive.'),
   async execute(interaction) {
     const embed = new EmbedBuilder()
       .setTitle('SYNTIX is online')
