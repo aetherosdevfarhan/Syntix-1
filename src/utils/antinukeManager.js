@@ -39,6 +39,34 @@ function buildWhitelistPanel(config) {
 const activity = new Map();
 const punishedRecently = new Map();
 
+// Both maps above only ever grow — recordAndCheck() trims each user's own timestamp array, but
+// never removes the guild/user/actionType keys themselves once they're empty, and punishedRecently
+// entries just sit there expired forever since nothing deletes them after their 30s cooldown
+// passes. On a long-running process (days/weeks, e.g. a phone that isn't restarted often) this is
+// a slow, unbounded memory leak. Sweep both every 10 minutes.
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [guildId, guildMap] of activity) {
+    for (const [userId, userMap] of guildMap) {
+      for (const [actionType, timestamps] of userMap) {
+        // We don't know each threshold's window here, so use a generous 15-minute cutoff —
+        // longer than any realistic threshold window, just to reclaim genuinely dead entries.
+        const fresh = timestamps.filter(t => now - t < 15 * 60 * 1000);
+        if (fresh.length) userMap.set(actionType, fresh);
+        else userMap.delete(actionType);
+      }
+      if (userMap.size === 0) guildMap.delete(userId);
+    }
+    if (guildMap.size === 0) activity.delete(guildId);
+  }
+
+  for (const [key, until] of punishedRecently) {
+    if (until <= now) punishedRecently.delete(key);
+  }
+}, SWEEP_INTERVAL_MS).unref();
+
 const MODULE_SELECT_ID = 'aeth_modules_select';
 const MODULE_DEFS = [
   { key: 'ban', label: 'Anti Ban' },
